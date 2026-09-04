@@ -919,6 +919,108 @@ def test_calculate_tou_cost_returns_empty_without_a_schedule() -> None:
     }
 
 
+def test_parse_gas_rate_schedule_returns_none_when_blank() -> None:
+    """An unset/blank gas schedule means the calculated gas cost feature is disabled."""
+    assert api.parse_gas_rate_schedule(None) is None
+    assert api.parse_gas_rate_schedule("") is None
+
+
+def test_parse_gas_rate_schedule_requires_positive_conversion_factor() -> None:
+    """A missing or non-positive MJ conversion factor is rejected."""
+    for bad_conversion in (json.dumps({"seasons": [{"months": [1], "tiers": [{"rate": 0.1}]}]}),):
+        with unittest.TestCase().assertRaises(ValueError):
+            api.parse_gas_rate_schedule(bad_conversion)
+
+
+def test_calculate_gas_cost_applies_seasonal_tiered_rates_to_average_daily_usage() -> None:
+    """Real-world-shaped GLOSAVE gas rates applied over a 30-day read period."""
+    schedule = api.parse_gas_rate_schedule(
+        json.dumps(
+            {
+                "daily_charge": 0.58685,
+                "conversion_mj_per_unit": 38.6,
+                "seasons": [
+                    {
+                        "name": "Summer",
+                        "months": [10, 11, 12, 1, 2, 3],
+                        "tiers": [
+                            {"limit_mj_per_day": 20.70, "rate": 0.03735},
+                            {"limit_mj_per_day": None, "rate": 0.02934},
+                        ],
+                    },
+                    {
+                        "name": "Winter",
+                        "months": [4, 5, 6, 7, 8, 9],
+                        "tiers": [
+                            {"limit_mj_per_day": 20.70, "rate": 0.03735},
+                            {"limit_mj_per_day": None, "rate": 0.02934},
+                        ],
+                    },
+                ],
+            }
+        )
+    )
+    history = [
+        {"date": "2026-08-01", "read_index": 100.0, "serial": "A"},
+        {"date": "2026-08-31", "read_index": 130.0, "serial": "A"},
+    ]
+
+    result = api.calculate_gas_cost(history, schedule)
+
+    assert result["periods"] == [
+        {
+            "start": "2026-08-01",
+            "end": "2026-08-31",
+            "days": 30,
+            "mj_used": 1158.0,
+            "avg_daily_mj": 38.6,
+            "season": "Winter",
+            "usage_cost": 38.95,
+            "daily_charge_cost": 17.61,
+            "total_cost": 56.56,
+        }
+    ]
+    assert result["latest_period_cost"] == 56.56
+    assert result["total_cost"] == 56.56
+
+
+def test_calculate_gas_cost_skips_meter_replacement_reset() -> None:
+    """A lower read on a new serial (meter replacement) is not billed as negative usage."""
+    schedule = api.parse_gas_rate_schedule(
+        json.dumps(
+            {
+                "conversion_mj_per_unit": 38.6,
+                "seasons": [
+                    {"months": list(range(1, 13)), "tiers": [{"rate": 0.03}]},
+                ],
+            }
+        )
+    )
+    history = [
+        {"date": "2026-08-01", "read_index": 500.0, "serial": "old"},
+        {"date": "2026-08-31", "read_index": 5.0, "serial": "new"},
+        {"date": "2026-09-30", "read_index": 20.0, "serial": "new"},
+    ]
+
+    result = api.calculate_gas_cost(history, schedule)
+
+    # Only the new-meter period (5.0 -> 20.0) should be billed.
+    assert len(result["periods"]) == 1
+    assert result["periods"][0]["mj_used"] == 579.0
+
+
+def test_calculate_gas_cost_returns_empty_without_a_schedule() -> None:
+    """No gas schedule configured means the calculated-cost feature stays disabled."""
+    result = api.calculate_gas_cost(
+        [
+            {"date": "2026-08-01", "read_index": 1.0, "serial": "a"},
+            {"date": "2026-08-31", "read_index": 2.0, "serial": "a"},
+        ],
+        None,
+    )
+    assert result == {"periods": [], "latest_period_cost": None, "total_cost": None}
+
+
 def test_meter_type_description_looks_up_by_serial() -> None:
     """Meter type descriptions are looked up by serial number, and missing serials are safe."""
     payload = {"data": {"700594829": "Smart", "080625": "Manually read interval"}}
@@ -1129,6 +1231,11 @@ def load_tests(
         test_cost_summary_breaks_down_by_charge_type,
         test_cost_summary_charge_type_totals_empty_when_type_missing,
         test_meter_type_description_looks_up_by_serial,
+        test_parse_gas_rate_schedule_returns_none_when_blank,
+        test_parse_gas_rate_schedule_requires_positive_conversion_factor,
+        test_calculate_gas_cost_applies_seasonal_tiered_rates_to_average_daily_usage,
+        test_calculate_gas_cost_skips_meter_replacement_reset,
+        test_calculate_gas_cost_returns_empty_without_a_schedule,
         test_parse_tou_rate_schedule_returns_none_when_blank,
         test_parse_tou_rate_schedule_parses_windows_and_supply_charge,
         test_parse_tou_rate_schedule_rejects_malformed_input,

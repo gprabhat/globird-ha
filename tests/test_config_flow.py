@@ -186,3 +186,36 @@ def test_options_flow_rejects_invalid_tou_rate_schedule() -> None:
 
     assert result["type"] == "form"
     assert result["errors"]["base"] == "invalid_tou_rate_schedule"
+
+
+def test_options_flow_saves_valid_gas_rate_schedule() -> None:
+    """A well-formed gas rate schedule is accepted and stored as-is."""
+    flow = config_flow.GloBirdOptionsFlow()
+    schedule_json = (
+        '{"conversion_mj_per_unit": 38.6, "seasons": '
+        '[{"months": [1,2,3,4,5,6,7,8,9,10,11,12], "tiers": [{"rate": 0.03}]}]}'
+    )
+
+    result = asyncio.run(
+        flow.async_step_init(
+            {"daily_poll_start_time": "03:00", "gas_rate_schedule": schedule_json}
+        )
+    )
+
+    assert result["type"] == "create_entry"
+    assert result["data"]["gas_rate_schedule"] == schedule_json
+
+
+def test_options_flow_rejects_invalid_gas_rate_schedule() -> None:
+    """An invalid gas rate schedule re-shows the form with an error, not a crash."""
+    flow = config_flow.GloBirdOptionsFlow()
+    flow.config_entry = ConfigEntry()
+
+    result = asyncio.run(
+        flow.async_step_init(
+            {"daily_poll_start_time": "03:00", "gas_rate_schedule": "not json"}
+        )
+    )
+
+    assert result["type"] == "form"
+    assert result["errors"]["base"] == "invalid_gas_rate_schedule"

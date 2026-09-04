@@ -612,6 +612,65 @@ def test_calculated_cost_sensor_exposes_latest_day_breakdown() -> None:
     assert attrs["schedule_error"] is None
 
 
+def test_calculated_gas_cost_sensor_unavailable_without_schedule() -> None:
+    """No configured gas rate schedule means the sensor is unavailable."""
+
+    class FakeCoordinator:
+        data = {"service_data": {"svc-gas": {"calculated_gas_cost_summary": {}}}}
+
+    sensor_entity = sensor.GloBirdCalculatedGasCostSensor(
+        FakeCoordinator(),
+        types.SimpleNamespace(entry_id="entry-1"),
+        {"accountServiceId": "svc-gas", "siteIdentifier": "svc-gas", "serviceType": "Gas"},
+    )
+
+    assert sensor_entity.available is False
+    assert sensor_entity.native_value is None
+
+
+def test_calculated_gas_cost_sensor_exposes_latest_period_breakdown() -> None:
+    """With a schedule configured, state/attributes reflect the latest billed period."""
+
+    class FakeCoordinator:
+        data = {
+            "gas_schedule_error": None,
+            "service_data": {
+                "svc-gas": {
+                    "calculated_gas_cost_summary": {
+                        "periods": [
+                            {
+                                "start": "2026-08-01",
+                                "end": "2026-08-31",
+                                "days": 30,
+                                "mj_used": 1158.0,
+                                "avg_daily_mj": 38.6,
+                                "season": "Winter",
+                                "usage_cost": 38.95,
+                                "daily_charge_cost": 17.61,
+                                "total_cost": 56.56,
+                            }
+                        ],
+                        "latest_period_cost": 56.56,
+                        "total_cost": 56.56,
+                    }
+                }
+            },
+        }
+
+    sensor_entity = sensor.GloBirdCalculatedGasCostSensor(
+        FakeCoordinator(),
+        types.SimpleNamespace(entry_id="entry-1"),
+        {"accountServiceId": "svc-gas", "siteIdentifier": "svc-gas", "serviceType": "Gas"},
+    )
+
+    assert sensor_entity.available is True
+    assert sensor_entity.native_value == 56.56
+    attrs = sensor_entity.extra_state_attributes
+    assert attrs["total_cost"] == 56.56
+    assert attrs["periods"] == 1
+    assert attrs["schedule_error"] is None
+
+
 def test_meter_info_sensor_exposes_meter_type_description() -> None:
     """Meter Info attributes surface the looked-up meter type description."""
 

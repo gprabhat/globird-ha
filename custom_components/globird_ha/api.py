@@ -1063,6 +1063,223 @@ def calculate_tou_cost(
     }
 
 
+def parse_gas_rate_schedule(raw: str | None) -> dict[str, Any] | None:
+    """Parse and validate a user-configured gas rate schedule.
+
+    Gas billing shapes nothing like electricity time-of-use: it is a daily
+    charge plus a seasonal, inclining-block $/MJ rate applied to *average*
+    daily usage across the meter read period (gas basic meters are read
+    periodically, not daily, so retailers bill on the average). GloBird
+    reports gas meter reads in the read unit (typically m3), so a heating
+    value conversion factor to MJ is required. Expected shape::
+
+        {
+            "daily_charge": 0.58685,
+            "conversion_mj_per_unit": 38.6,
+            "seasons": [
+                {"name": "Summer", "months": [10, 11, 12, 1, 2, 3],
+                 "tiers": [{"limit_mj_per_day": 20.70, "rate": 0.03735},
+                           {"limit_mj_per_day": null, "rate": 0.02934}]},
+                {"name": "Winter", "months": [4, 5, 6, 7, 8, 9],
+                 "tiers": [{"limit_mj_per_day": 20.70, "rate": 0.03735},
+                           {"limit_mj_per_day": null, "rate": 0.02934}]}
+            ]
+        }
+
+    Tiers apply in order to average daily MJ usage; a `limit_mj_per_day` of
+    null means "the remainder" and should only appear on the last tier.
+
+    Returns None when raw is empty/not configured. Raises ValueError for
+    malformed input so callers can surface a clear config error.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("Gas rate schedule must be a JSON object")
+
+    seasons_raw = parsed.get("seasons")
+    if not isinstance(seasons_raw, list) or not seasons_raw:
+        raise ValueError("Gas rate schedule must include a non-empty 'seasons' list")
+
+    seasons: list[dict[str, Any]] = []
+    for season in seasons_raw:
+        if not isinstance(season, dict):
+            raise ValueError("Each gas season must be a JSON object")
+
+        months_raw = season.get("months")
+        if not isinstance(months_raw, list) or not months_raw:
+            raise ValueError(f"Invalid gas season months: {season!r}")
+        months: list[int] = []
+        for value in months_raw:
+            month = int(value)
+            if not (1 <= month <= 12):
+                raise ValueError(f"Invalid month '{value}' in gas season: {season!r}")
+            months.append(month)
+
+        tiers_raw = season.get("tiers")
+        if not isinstance(tiers_raw, list) or not tiers_raw:
+            raise ValueError(f"Invalid gas season tiers: {season!r}")
+        tiers: list[dict[str, Any]] = []
+        for tier in tiers_raw:
+            if not isinstance(tier, dict):
+                raise ValueError(f"Invalid gas tier: {tier!r}")
+            rate = _as_float(tier.get("rate"))
+            if rate is None:
+                raise ValueError(f"Invalid gas tier rate: {tier!r}")
+            limit_raw = tier.get("limit_mj_per_day")
+            limit = _as_float(limit_raw) if limit_raw is not None else None
+            tiers.append({"limit_mj_per_day": limit, "rate": rate})
+
+        seasons.append(
+            {
+                "name": str(season.get("name") or "").strip() or None,
+                "months": months,
+                "tiers": tiers,
+            }
+        )
+
+    conversion = _as_float(parsed.get("conversion_mj_per_unit"))
+    if conversion is None or conversion <= 0:
+        raise ValueError(
+            "Gas rate schedule must include a positive 'conversion_mj_per_unit'"
+        )
+    daily_charge = _as_float(parsed.get("daily_charge")) or 0.0
+
+    return {
+        "daily_charge": daily_charge,
+        "conversion_mj_per_unit": conversion,
+        "seasons": seasons,
+    }
+
+
+def _gas_season_for_date(day: date, seasons: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the configured season covering a given date's month."""
+    return next((season for season in seasons if day.month in season["months"]), None)
+
+
+def _gas_tiered_usage_cost(daily_mj: float, tiers: list[dict[str, Any]]) -> float:
+    """Apply inclining-block $/MJ tiers to an average daily MJ usage figure."""
+    remaining = daily_mj
+    cost = 0.0
+    for tier in tiers:
+        if remaining <= 0:
+            break
+        limit = tier["limit_mj_per_day"]
+        if limit is None:
+            cost += remaining * tier["rate"]
+            remaining = 0.0
+            break
+        take = min(remaining, limit)
+        cost += take * tier["rate"]
+        remaining -= take
+    return cost
+
+
+def calculate_gas_cost(
+    history: list[dict[str, Any]],
+    schedule: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Calculate estimated gas cost per meter-read period from a rate schedule.
+
+    Gas basic meters are read periodically (not daily), so each consecutive
+    pair of reads for the same meter becomes one billed period: usage is
+    converted to MJ, averaged over the days in that period, tiered per the
+    matching season, and a per-day supply charge is added for the period.
+    Meter replacements (a lower read on a new serial) are skipped rather
+    than treated as negative usage, mirroring the recorder statistics import.
+    """
+    empty: dict[str, Any] = {
+        "periods": [],
+        "latest_period_cost": None,
+        "total_cost": None,
+    }
+    if not schedule or not isinstance(history, list):
+        return empty
+
+    rows = sorted(
+        (
+            row
+            for row in history
+            if isinstance(row, dict)
+            and _parse_date(row.get("date")) is not None
+            and isinstance(row.get("read_index"), (int, float))
+        ),
+        key=lambda row: (str(row.get("date") or ""), str(row.get("serial") or "")),
+    )
+    if len(rows) < 2:
+        return empty
+
+    conversion = schedule["conversion_mj_per_unit"]
+    daily_charge = schedule.get("daily_charge") or 0.0
+    seasons = schedule.get("seasons") or []
+
+    meter_high_water: dict[str, float] = {}
+    periods: list[dict[str, Any]] = []
+    previous_row: dict[str, Any] | None = None
+
+    for row in rows:
+        reading = float(row["read_index"])
+        meter_key = str(row.get("serial") or "unknown")
+        previous_reading = meter_high_water.get(meter_key)
+        meter_high_water[meter_key] = (
+            reading if previous_reading is None else max(previous_reading, reading)
+        )
+
+        if previous_row is not None and previous_reading is not None and reading > previous_reading:
+            start_day = _parse_date(previous_row.get("date"))
+            end_day = _parse_date(row.get("date"))
+            days = (end_day - start_day).days if start_day and end_day else 0
+            if days > 0:
+                units_used = reading - previous_reading
+                mj_used = units_used * conversion
+                avg_daily_mj = mj_used / days
+                season = _gas_season_for_date(end_day, seasons)
+                if season is not None:
+                    usage_cost = _gas_tiered_usage_cost(avg_daily_mj, season["tiers"]) * days
+                    daily_charge_cost = daily_charge * days
+                    periods.append(
+                        {
+                            "start": start_day.isoformat(),
+                            "end": end_day.isoformat(),
+                            "days": days,
+                            "mj_used": _round(mj_used, 3),
+                            "avg_daily_mj": _round(avg_daily_mj, 3),
+                            "season": season.get("name"),
+                            "usage_cost": _round(usage_cost, 2),
+                            "daily_charge_cost": _round(daily_charge_cost, 2),
+                            "total_cost": _round(usage_cost + daily_charge_cost, 2),
+                        }
+                    )
+        previous_row = row
+
+    if not periods:
+        return empty
+
+    periods.sort(key=lambda period: period["end"])
+    latest = periods[-1]
+    return {
+        "periods": periods,
+        "latest_period_cost": latest["total_cost"],
+        "total_cost": _round(sum(period["total_cost"] for period in periods), 2),
+    }
+
+
+def gas_cost_attributes(summary: dict[str, Any]) -> dict[str, Any]:
+    """Return recorder-safe calculated gas cost attributes."""
+    periods = summary.get("periods", [])
+    periods = periods if isinstance(periods, list) else []
+    return {
+        "periods": len(periods),
+        "latest_period_cost": summary.get("latest_period_cost"),
+        "total_cost": summary.get("total_cost"),
+        "recent_periods": _recent_rows(periods),
+        "periods_truncated": len(periods) > ATTR_RECENT_ROW_LIMIT,
+    }
+
+
 def build_billing_period_projection(
     daily_totals: list[dict[str, Any]] | None,
     billing_period_start: date | None,

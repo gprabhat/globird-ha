@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
 from datetime import datetime, time as dt_time, timedelta
 from typing import Any, Awaitable, Callable
 
@@ -21,9 +22,11 @@ from .api import (
     build_latest_data_status,
     build_usage_summary,
     build_weather_summary,
+    calculate_gas_cost,
     calculate_tou_cost,
     extract_accounts_and_services,
     meter_type_description,
+    parse_gas_rate_schedule,
     parse_tou_rate_schedule,
     select_meter_for_service,
     service_id,
@@ -32,6 +35,7 @@ from .const import (
     ACCOUNT_UPDATE_INTERVAL,
     CONF_DAILY_POLL_START_TIME,
     CONF_EMAIL,
+    CONF_GAS_RATE_SCHEDULE,
     CONF_PASSWORD,
     CONF_TOU_RATE_SCHEDULE,
     DEFAULT_DAILY_POLL_START_TIME,
@@ -112,7 +116,7 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         options = getattr(self.entry, "options", {})
         configured = (
             options.get(CONF_DAILY_POLL_START_TIME)
-            if isinstance(options, dict)
+            if isinstance(options, Mapping)
             else None
         )
         return _parse_daily_poll_start_time(configured)
@@ -126,11 +130,29 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         failing the whole update.
         """
         options = getattr(self.entry, "options", {})
-        raw = options.get(CONF_TOU_RATE_SCHEDULE) if isinstance(options, dict) else None
+        raw = (
+            options.get(CONF_TOU_RATE_SCHEDULE)
+            if isinstance(options, Mapping)
+            else None
+        )
         try:
             return parse_tou_rate_schedule(raw), None
         except (ValueError, TypeError) as err:
             _LOGGER.warning("GloBird TOU rate schedule is invalid: %s", err)
+            return None, str(err)
+
+    def _parsed_gas_rate_schedule(self) -> tuple[dict[str, Any] | None, str | None]:
+        """Return the configured gas rate schedule and any parse error message."""
+        options = getattr(self.entry, "options", {})
+        raw = (
+            options.get(CONF_GAS_RATE_SCHEDULE)
+            if isinstance(options, Mapping)
+            else None
+        )
+        try:
+            return parse_gas_rate_schedule(raw), None
+        except (ValueError, TypeError) as err:
+            _LOGGER.warning("GloBird gas rate schedule is invalid: %s", err)
             return None, str(err)
 
     def _set_update_interval_for_data(self, data: dict[str, Any]) -> None:
@@ -304,6 +326,8 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             tou_schedule, tou_schedule_error = self._parsed_tou_rate_schedule()
             data["tou_schedule_error"] = tou_schedule_error
+            gas_schedule, gas_schedule_error = self._parsed_gas_rate_schedule()
+            data["gas_schedule_error"] = gas_schedule_error
 
             cached_service_data = cache.get("service_data", {})
             cached_service_data = (
@@ -319,6 +343,7 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     data.get("service_status"),
                     data.get("meter_types"),
                     tou_schedule,
+                    gas_schedule,
                     cached_detail if isinstance(cached_detail, dict) else {},
                 )
 
@@ -350,6 +375,7 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         status_payload: dict[str, Any] | None,
         meter_types_payload: dict[str, Any] | None,
         tou_schedule: dict[str, Any] | None,
+        gas_schedule: dict[str, Any] | None,
         cache: dict[str, Any],
     ) -> dict[str, Any]:
         """Fetch heavier per-service detail."""
@@ -429,6 +455,11 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not is_gas_service
             else {}
         )
+        calculated_gas_cost_summary = (
+            calculate_gas_cost(gas_reading_summary.get("history", []), gas_schedule)
+            if is_gas_service
+            else {}
+        )
 
         return {
             "service": service,
@@ -444,6 +475,7 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "cost": cost,
             "cost_summary": cost_summary,
             "calculated_cost_summary": calculated_cost_summary,
+            "calculated_gas_cost_summary": calculated_gas_cost_summary,
             "latest_data_status": build_latest_data_status(usage_summary, cost_summary),
             "weather": weather,
             "weather_summary": build_weather_summary(weather),

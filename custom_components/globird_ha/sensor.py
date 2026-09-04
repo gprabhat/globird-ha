@@ -31,6 +31,7 @@ from .api import (
     build_latest_data_status,
     calculated_cost_attributes,
     cost_attributes,
+    gas_cost_attributes,
     service_id,
     usage_attributes,
 )
@@ -520,6 +521,7 @@ async def async_setup_entry(
                         config_entry,
                         service,
                     ),
+                    GloBirdCalculatedGasCostSensor(coordinator, config_entry, service),
                 ]
             )
         else:
@@ -972,6 +974,48 @@ class GloBirdLatestGasReadingDateSensor(GloBirdServiceBaseSensor):
                     "latest_reading_quality_method"
                 ),
             }
+        )
+        return attrs
+
+
+class GloBirdCalculatedGasCostSensor(GloBirdServiceBaseSensor):
+    """Estimated gas cost calculated from meter reads and a user-configured
+    seasonal, tiered rate schedule.
+
+    GloBird's API exposes no usable gas rate data either, so this is
+    calculated locally from a rate schedule entered in integration options
+    (daily charge + seasonal $/MJ tiers) applied to average daily usage
+    across each meter-read period. Stays unavailable until a schedule is
+    configured.
+    """
+
+    sensor_key = "calculated_gas_cost"
+    sensor_name = "Calculated Gas Cost"
+    icon = "mdi:calculator-variant"
+    native_unit_of_measurement = CURRENCY_AUD
+    device_class = SensorDeviceClass.MONETARY
+    state_class = None
+
+    @property
+    def available(self) -> bool:
+        """Only available once a gas rate schedule is configured and valid."""
+        summary = self._service_detail().get("calculated_gas_cost_summary") or {}
+        return bool(summary.get("periods"))
+
+    @property
+    def native_value(self) -> Any:
+        """Return the most recent billed period's total cost."""
+        summary = self._service_detail().get("calculated_gas_cost_summary") or {}
+        return summary.get("latest_period_cost")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return calculated gas cost breakdown attributes."""
+        attrs = self._service_attrs()
+        summary = self._service_detail().get("calculated_gas_cost_summary") or {}
+        attrs.update(gas_cost_attributes(summary))
+        attrs["schedule_error"] = (self.coordinator.data or {}).get(
+            "gas_schedule_error"
         )
         return attrs
 
