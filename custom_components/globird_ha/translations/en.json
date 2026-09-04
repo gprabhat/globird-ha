@@ -24,7 +24,7 @@
     "step": {
       "init": {
         "title": "GloBird HA options",
-        "description": "Set when automatic daily readiness polling resumes after the previous day is ready. Optionally enter a time-of-use rate schedule as JSON (GloBird's API does not expose rate data, so this must come from your own contract/bill) to enable Calculated TOU Cost sensors, e.g. {\"supply_charge\": 1.12, \"periods\": [{\"name\": \"Offpeak Usage\", \"rate\": 0.28, \"windows\": [[\"00:00\",\"15:00\"],[\"21:00\",\"24:00\"]]}, {\"name\": \"Peak Usage\", \"rate\": 0.45, \"windows\": [[\"15:00\",\"21:00\"]]}]}. Leave blank to leave those sensors unavailable.",
+        "description": "Set when automatic daily readiness polling resumes after the previous day is ready. Optionally enter a time-of-use rate schedule as JSON (GloBird's API does not expose rate data, so this must come from your own contract/bill) to enable the Calculated TOU Cost sensor - see the README for the expected format. Leave blank to leave that sensor unavailable.",
         "data": {
           "daily_poll_start_time": "Daily polling start time",
           "tou_rate_schedule": "Time-of-use rate schedule (JSON, optional)"
