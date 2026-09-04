@@ -45,6 +45,10 @@ class Required:
         return hash((self.key, self.default))
 
 
+class Optional(Required):
+    """Minimal optional field marker."""
+
+
 class ConfigFlow:
     """Minimal stand-in for Home Assistant's config flow base."""
 
@@ -97,10 +101,11 @@ config_entries.ConfigFlow = ConfigFlow
 config_entries.OptionsFlow = OptionsFlow
 data_entry_flow.FlowResult = dict[str, Any]
 voluptuous.Required = Required
+voluptuous.Optional = Optional
 voluptuous.Schema = Schema
 selector.TextSelector = TextSelector
 selector.TextSelectorConfig = lambda **kwargs: kwargs
-selector.TextSelectorType = types.SimpleNamespace(PASSWORD="password")
+selector.TextSelectorType = types.SimpleNamespace(PASSWORD="password", TEXT="text")
 selector.TimeSelector = TimeSelector
 helpers.selector = selector
 homeassistant.config_entries = config_entries
@@ -148,3 +153,36 @@ def test_options_flow_saves_daily_poll_start_time() -> None:
         "title": "",
         "data": {"daily_poll_start_time": "03:00"},
     }
+
+
+def test_options_flow_saves_valid_tou_rate_schedule() -> None:
+    """A well-formed TOU rate schedule is accepted and stored as-is."""
+    flow = config_flow.GloBirdOptionsFlow()
+    schedule_json = (
+        '{"supply_charge": 1.0, "periods": '
+        '[{"name": "Peak", "rate": 0.4, "windows": [["15:00", "21:00"]]}]}'
+    )
+
+    result = asyncio.run(
+        flow.async_step_init(
+            {"daily_poll_start_time": "03:00", "tou_rate_schedule": schedule_json}
+        )
+    )
+
+    assert result["type"] == "create_entry"
+    assert result["data"]["tou_rate_schedule"] == schedule_json
+
+
+def test_options_flow_rejects_invalid_tou_rate_schedule() -> None:
+    """An invalid TOU rate schedule re-shows the form with an error, not a crash."""
+    flow = config_flow.GloBirdOptionsFlow()
+    flow.config_entry = ConfigEntry()
+
+    result = asyncio.run(
+        flow.async_step_init(
+            {"daily_poll_start_time": "03:00", "tou_rate_schedule": "not json"}
+        )
+    )
+
+    assert result["type"] == "form"
+    assert result["errors"]["base"] == "invalid_tou_rate_schedule"

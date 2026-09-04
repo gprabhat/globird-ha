@@ -67,6 +67,7 @@ Service-level sensors include:
 - Billing period days
 - Billing period cost
 - Weather summary
+- Calculated TOU cost (only when a rate schedule is configured)
 
 Gas service-level sensors include:
 
@@ -83,6 +84,10 @@ For electricity import usage, smart-meter intervals across the cached usage wind
 
 The portal attaches the same full-day interval array to every time-of-use row (e.g. Peak and Offpeak) for a meter, with only the billed portion differing per row; the integration counts each day's interval array once per meter register rather than once per time-of-use row, so time-of-use accounts don't get their interval data double-counted.
 
+Net daily cost is also imported into recorder long-term statistics under the Recent Cost Total sensor (daily resolution only, since GloBird does not publish half-hourly cost detail). Pair it with the Recent Usage Total statistic as the cost stat for grid consumption in the Energy Dashboard's settings to see $ alongside kWh.
+
+Both statistics imports are additive only: every sync re-uploads the currently cached ~31-day window, which upserts (adds or corrects) that window and backfills any day GloBird has newly published, but never deletes or touches statistics outside that window. History older than 31 days that was written by a previous sync is left untouched in Home Assistant's recorder and is only ever removed by your own recorder purge configuration or a manual statistics fix, never by this integration.
+
 ## Updates and data freshness
 
 Home Assistant polls the GloBird portal every 30 minutes until all discovered electricity services have `ready` latest data for yesterday or newer. Gas services do not block that readiness check because basic-meter reads are not published daily. Once the electricity data is ready, or after a successful refresh for a gas-only account, polling slows until the configured daily polling start time on the next day to avoid unnecessary portal requests and repeated recorder updates for data that will not change again that day. The default start time is 00:05 local Home Assistant time, and it can be changed from the integration options if your GloBird account normally publishes data later. You can still force a check at any time with Home Assistant's standard **Update entity** action on any GloBird entity. Refresh Status only reports whether the latest portal fetch completed; it does not mean GloBird has finished publishing all derived daily usage, cost, and ZeroHero values.
@@ -93,7 +98,21 @@ ZeroHero status reports the latest complete portal result as `achieved` or `miss
 
 Expected Monthly Cost projects the current billing period from completed daily net cost totals, using the latest invoice issue date as the billing-period start and a 30-day period. Billing Period Cost uses the same daily net totals so it matches the projection inputs. Billing Period Days uses Home Assistant's local date rather than the host process timezone.
 
-Pricing/rate-plan sensors are not currently exposed. The portal exposes product metadata, but not enough rate detail has been validated to provide EMHASS-ready import/export price sensors safely.
+Pricing/rate-plan sensors are not populated from the portal. GloBird's API exposes only product metadata (plan name, start/end date, a couple of flags) through `getProductsByAccountId` and `getAllProductHistoriesByAccountId` — verified directly, neither returns $/kWh rate figures — so there isn't enough rate detail available to derive prices automatically or safely provide EMHASS-ready import/export price sensors.
+
+Instead, you can enter your own time-of-use rate schedule (from your contract/bill) as JSON in the integration options to enable the **Calculated TOU Cost** sensor per electricity service. It stays unavailable until a schedule is configured. Example:
+
+```json
+{
+  "supply_charge": 1.12,
+  "periods": [
+    {"name": "Offpeak Usage", "rate": 0.28, "windows": [["00:00", "15:00"], ["21:00", "24:00"]]},
+    {"name": "Peak Usage", "rate": 0.45, "windows": [["15:00", "21:00"]]}
+  ]
+}
+```
+
+Each period's `windows` are `[start, end)` 24-hour clock pairs (`"24:00"` means midnight at the end of the day); `name` is just a label (matching your bill's chargeType names, e.g. "Peak Usage", makes the breakdown easier to read but isn't required for the calculation to work). The sensor state is the latest calculated day's total cost; attributes include the per-period kWh/cost breakdown, a recent daily history, and `unassigned_kwh` for any usage that fell outside all configured windows (a sign the schedule doesn't fully cover the day and should be adjusted). The calculation uses the same real per-interval usage that feeds the half-hourly statistics import, so it reflects actual consumption shape, not just a daily total split evenly across periods.
 
 ## Notes
 

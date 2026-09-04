@@ -803,6 +803,122 @@ def test_cost_summary_charge_type_totals_empty_when_type_missing() -> None:
     assert cost["charge_type_totals"] == []
 
 
+def test_parse_tou_rate_schedule_returns_none_when_blank() -> None:
+    """An unset/blank schedule means the calculated cost feature is disabled."""
+    assert api.parse_tou_rate_schedule(None) is None
+    assert api.parse_tou_rate_schedule("") is None
+    assert api.parse_tou_rate_schedule("   ") is None
+
+
+def test_parse_tou_rate_schedule_parses_windows_and_supply_charge() -> None:
+    """A valid schedule normalizes clock strings into minutes since midnight."""
+    schedule = api.parse_tou_rate_schedule(
+        json.dumps(
+            {
+                "supply_charge": 1.12,
+                "periods": [
+                    {
+                        "name": "Offpeak Usage",
+                        "rate": 0.28,
+                        "windows": [["00:00", "15:00"], ["21:00", "24:00"]],
+                    },
+                    {"name": "Peak Usage", "rate": 0.45, "windows": [["15:00", "21:00"]]},
+                ],
+            }
+        )
+    )
+
+    assert schedule["supply_charge"] == 1.12
+    assert schedule["periods"][0] == {
+        "name": "Offpeak Usage",
+        "rate": 0.28,
+        "windows": [(0, 900), (1260, 1440)],
+    }
+    assert schedule["periods"][1]["windows"] == [(900, 1260)]
+
+
+def test_parse_tou_rate_schedule_rejects_malformed_input() -> None:
+    """Malformed schedules raise ValueError so callers can surface a config error."""
+    for bad in (
+        "not json",
+        "[]",
+        json.dumps({"periods": []}),
+        json.dumps({"periods": [{"name": "Peak", "rate": 0.4}]}),
+        json.dumps(
+            {"periods": [{"name": "Peak", "rate": 0.4, "windows": [["21:00", "15:00"]]}]}
+        ),
+    ):
+        with unittest.TestCase().assertRaises(ValueError):
+            api.parse_tou_rate_schedule(bad)
+
+
+def test_calculate_tou_cost_splits_usage_by_configured_windows() -> None:
+    """Interval usage is bucketed into whichever configured window it falls in."""
+    schedule = api.parse_tou_rate_schedule(
+        json.dumps(
+            {
+                "supply_charge": 1.0,
+                "periods": [
+                    {"name": "Offpeak", "rate": 0.20, "windows": [["00:00", "12:00"]]},
+                    {"name": "Peak", "rate": 0.50, "windows": [["12:00", "24:00"]]},
+                ],
+            }
+        )
+    )
+    # 4 intervals/day => 6 hours each: [0-6h, 6-12h, 12-18h, 18-24h)
+    intervals_by_day = [
+        {"readDate": "2026-09-01", "intervals": [1.0, 1.0, 2.0, 2.0]},
+    ]
+
+    result = api.calculate_tou_cost(intervals_by_day, schedule)
+
+    assert result["days"] == 1
+    assert result["latest_day"] == "2026-09-01"
+    day = result["daily"][0]
+    # Offpeak: 1.0 + 1.0 = 2.0 kWh * 0.20 = 0.40; Peak: 2.0+2.0=4.0 kWh * 0.50 = 2.00
+    assert day["usage_cost"] == 2.40
+    assert day["total_cost"] == 3.40  # + 1.0 supply charge
+    assert day["unassigned_kwh"] == 0.0
+    periods_by_name = {p["name"]: p for p in day["periods"]}
+    assert periods_by_name["Offpeak"] == {"name": "Offpeak", "kwh": 2.0, "cost": 0.4, "rate": 0.20}
+    assert periods_by_name["Peak"] == {"name": "Peak", "kwh": 4.0, "cost": 2.0, "rate": 0.50}
+    assert result["total_cost"] == 3.40
+
+
+def test_calculate_tou_cost_tracks_unassigned_usage_outside_configured_windows() -> None:
+    """Usage outside any configured window is tracked, not silently dropped."""
+    schedule = api.parse_tou_rate_schedule(
+        json.dumps(
+            {
+                "periods": [
+                    {"name": "Evening", "rate": 0.40, "windows": [["18:00", "24:00"]]},
+                ],
+            }
+        )
+    )
+    intervals_by_day = [{"readDate": "2026-09-01", "intervals": [1.0, 1.0]}]
+
+    result = api.calculate_tou_cost(intervals_by_day, schedule)
+
+    day = result["daily"][0]
+    assert day["unassigned_kwh"] == 2.0
+    assert day["usage_cost"] == 0.0
+
+
+def test_calculate_tou_cost_returns_empty_without_a_schedule() -> None:
+    """No schedule configured means the calculated-cost feature stays disabled."""
+    result = api.calculate_tou_cost(
+        [{"readDate": "2026-09-01", "intervals": [1.0]}], None
+    )
+    assert result == {
+        "days": 0,
+        "daily": [],
+        "latest_day": None,
+        "latest_day_cost": None,
+        "total_cost": None,
+    }
+
+
 def test_meter_type_description_looks_up_by_serial() -> None:
     """Meter type descriptions are looked up by serial number, and missing serials are safe."""
     payload = {"data": {"700594829": "Smart", "080625": "Manually read interval"}}
@@ -1013,6 +1129,12 @@ def load_tests(
         test_cost_summary_breaks_down_by_charge_type,
         test_cost_summary_charge_type_totals_empty_when_type_missing,
         test_meter_type_description_looks_up_by_serial,
+        test_parse_tou_rate_schedule_returns_none_when_blank,
+        test_parse_tou_rate_schedule_parses_windows_and_supply_charge,
+        test_parse_tou_rate_schedule_rejects_malformed_input,
+        test_calculate_tou_cost_splits_usage_by_configured_windows,
+        test_calculate_tou_cost_tracks_unassigned_usage_outside_configured_windows,
+        test_calculate_tou_cost_returns_empty_without_a_schedule,
         test_cost_summary_exposes_new_category_totals,
         test_cost_summary_projects_current_month_cost,
         test_sensor_attributes_are_recorder_safe_summaries,

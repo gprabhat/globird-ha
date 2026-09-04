@@ -24,11 +24,15 @@
     "step": {
       "init": {
         "title": "GloBird HA options",
-        "description": "Set when automatic daily readiness polling resumes after the previous day is ready.",
+        "description": "Set when automatic daily readiness polling resumes after the previous day is ready. Optionally enter a time-of-use rate schedule as JSON (GloBird's API does not expose rate data, so this must come from your own contract/bill) to enable Calculated TOU Cost sensors, e.g. {\"supply_charge\": 1.12, \"periods\": [{\"name\": \"Offpeak Usage\", \"rate\": 0.28, \"windows\": [[\"00:00\",\"15:00\"],[\"21:00\",\"24:00\"]]}, {\"name\": \"Peak Usage\", \"rate\": 0.45, \"windows\": [[\"15:00\",\"21:00\"]]}]}. Leave blank to leave those sensors unavailable.",
         "data": {
-          "daily_poll_start_time": "Daily polling start time"
+          "daily_poll_start_time": "Daily polling start time",
+          "tou_rate_schedule": "Time-of-use rate schedule (JSON, optional)"
         }
       }
+    },
+    "error": {
+      "invalid_tou_rate_schedule": "Time-of-use rate schedule is not valid JSON or is missing required fields"
     }
   },
   "entity": {
@@ -83,6 +87,12 @@
       },
       "latest_day_cost": {
         "name": "Latest Daily Cost"
+      },
+      "calculated_cost": {
+        "name": "Calculated TOU Cost"
+      },
+      "weather_impacted_days": {
+        "name": "Weather Impacted Days"
       },
       "zerohero_status": {
         "name": "ZeroHero Status"

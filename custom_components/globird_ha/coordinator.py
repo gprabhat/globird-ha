@@ -21,8 +21,10 @@ from .api import (
     build_latest_data_status,
     build_usage_summary,
     build_weather_summary,
+    calculate_tou_cost,
     extract_accounts_and_services,
     meter_type_description,
+    parse_tou_rate_schedule,
     select_meter_for_service,
     service_id,
 )
@@ -31,6 +33,7 @@ from .const import (
     CONF_DAILY_POLL_START_TIME,
     CONF_EMAIL,
     CONF_PASSWORD,
+    CONF_TOU_RATE_SCHEDULE,
     DEFAULT_DAILY_POLL_START_TIME,
     DEFAULT_USAGE_DAYS,
     DEFAULT_GAS_READING_DAYS,
@@ -113,6 +116,22 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else None
         )
         return _parse_daily_poll_start_time(configured)
+
+    def _parsed_tou_rate_schedule(self) -> tuple[dict[str, Any] | None, str | None]:
+        """Return the configured TOU rate schedule and any parse error message.
+
+        GloBird's API exposes no usable $/kWh rate data, so this is entered
+        manually in integration options. Invalid input degrades to "no
+        schedule" (calculated-cost sensors stay unavailable) rather than
+        failing the whole update.
+        """
+        options = getattr(self.entry, "options", {})
+        raw = options.get(CONF_TOU_RATE_SCHEDULE) if isinstance(options, dict) else None
+        try:
+            return parse_tou_rate_schedule(raw), None
+        except (ValueError, TypeError) as err:
+            _LOGGER.warning("GloBird TOU rate schedule is invalid: %s", err)
+            return None, str(err)
 
     def _set_update_interval_for_data(self, data: dict[str, Any]) -> None:
         """Slow polling after all electricity services have the latest daily data."""
@@ -283,6 +302,9 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             finally:
                 self.client.enable_reauth()
 
+            tou_schedule, tou_schedule_error = self._parsed_tou_rate_schedule()
+            data["tou_schedule_error"] = tou_schedule_error
+
             cached_service_data = cache.get("service_data", {})
             cached_service_data = (
                 cached_service_data if isinstance(cached_service_data, dict) else {}
@@ -296,6 +318,7 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     data.get("read_meters"),
                     data.get("service_status"),
                     data.get("meter_types"),
+                    tou_schedule,
                     cached_detail if isinstance(cached_detail, dict) else {},
                 )
 
@@ -326,6 +349,7 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         meters_payload: dict[str, Any] | None,
         status_payload: dict[str, Any] | None,
         meter_types_payload: dict[str, Any] | None,
+        tou_schedule: dict[str, Any] | None,
         cache: dict[str, Any],
     ) -> dict[str, Any]:
         """Fetch heavier per-service detail."""
@@ -400,6 +424,11 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         usage_summary = build_usage_summary(usage) if not is_gas_service else {}
         gas_reading_summary = build_gas_reading_summary(usage) if is_gas_service else {}
         cost_summary = build_cost_summary(cost)
+        calculated_cost_summary = (
+            calculate_tou_cost(usage_summary.get("intervals_by_day", []), tou_schedule)
+            if not is_gas_service
+            else {}
+        )
 
         return {
             "service": service,
@@ -414,6 +443,7 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "gas_reading_summary": gas_reading_summary,
             "cost": cost,
             "cost_summary": cost_summary,
+            "calculated_cost_summary": calculated_cost_summary,
             "latest_data_status": build_latest_data_status(usage_summary, cost_summary),
             "weather": weather,
             "weather_summary": build_weather_summary(weather),

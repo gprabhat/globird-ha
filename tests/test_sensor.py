@@ -499,6 +499,119 @@ def test_usage_total_sensor_exposes_recent_intervals_by_day() -> None:
     assert attrs["intervals_by_day_truncated"] is False
 
 
+def test_daily_cost_statistics_accumulate_across_days() -> None:
+    """Each day's net cost total becomes a statistic row with a running sum."""
+    local_tz = timezone(timedelta(hours=10))
+    statistics = sensor._build_daily_cost_statistics(
+        [
+            {"date": "2026/09/01", "amount": 2.47},
+            {"date": "2026/09/02", "amount": 2.35},
+            {"date": "2026/09/03", "amount": 2.55},
+        ],
+        tzinfo=local_tz,
+    )
+
+    assert [row["state"] for row in statistics] == [2.47, 2.35, 2.55]
+    assert [row["sum"] for row in statistics] == [2.47, 4.82, 7.37]
+    assert statistics[0]["start"] == datetime(2026, 9, 1, 0, 0, tzinfo=local_tz)
+    assert statistics[2]["start"] == datetime(2026, 9, 3, 0, 0, tzinfo=local_tz)
+
+
+def test_daily_cost_statistics_skip_rows_without_a_parseable_date_or_amount() -> None:
+    """Malformed rows are ignored rather than raising."""
+    statistics = sensor._build_daily_cost_statistics(
+        [
+            {"date": "not-a-date", "amount": 1.0},
+            {"date": "2026/09/01", "amount": None},
+            {"date": "2026/09/02", "amount": 3.0},
+        ],
+        tzinfo=timezone.utc,
+    )
+
+    assert len(statistics) == 1
+    assert statistics[0]["sum"] == 3.0
+
+
+def test_cost_total_sensor_statistic_id_matches_usage_pattern() -> None:
+    """Cost statistics reuse the same recorder-safe id derivation as usage/gas."""
+    suffix = sensor._safe_statistic_id("entry-1_service_svc-1_cost_total", "svc-1")
+    statistic_id = f"{sensor.DOMAIN}:{suffix}"
+    assert statistic_id.startswith(f"{sensor.DOMAIN}:")
+    assert "cost_total" in statistic_id
+
+
+def test_calculated_cost_sensor_unavailable_without_schedule() -> None:
+    """No configured TOU schedule means the sensor is unavailable, not zero."""
+
+    class FakeCoordinator:
+        data = {"service_data": {"svc-1": {"calculated_cost_summary": {}}}}
+
+    sensor_entity = sensor.GloBirdCalculatedCostSensor(
+        FakeCoordinator(),
+        types.SimpleNamespace(entry_id="entry-1"),
+        {"accountServiceId": "svc-1", "siteIdentifier": "svc-1", "serviceType": "Power"},
+    )
+
+    assert sensor_entity.available is False
+    assert sensor_entity.native_value is None
+
+
+def test_calculated_cost_sensor_exposes_latest_day_breakdown() -> None:
+    """With a schedule configured, state/attributes reflect the latest calculated day."""
+
+    class FakeCoordinator:
+        data = {
+            "tou_schedule_error": None,
+            "service_data": {
+                "svc-1": {
+                    "calculated_cost_summary": {
+                        "days": 1,
+                        "latest_day": "2026-09-01",
+                        "latest_day_cost": 3.40,
+                        "total_cost": 3.40,
+                        "daily": [
+                            {
+                                "readDate": "2026-09-01",
+                                "total_cost": 3.40,
+                                "usage_cost": 2.40,
+                                "supply_charge": 1.0,
+                                "unassigned_kwh": 0.0,
+                                "periods": [
+                                    {
+                                        "name": "Offpeak",
+                                        "kwh": 2.0,
+                                        "cost": 0.4,
+                                        "rate": 0.2,
+                                    },
+                                    {
+                                        "name": "Peak",
+                                        "kwh": 4.0,
+                                        "cost": 2.0,
+                                        "rate": 0.5,
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                }
+            },
+        }
+
+    sensor_entity = sensor.GloBirdCalculatedCostSensor(
+        FakeCoordinator(),
+        types.SimpleNamespace(entry_id="entry-1"),
+        {"accountServiceId": "svc-1", "siteIdentifier": "svc-1", "serviceType": "Power"},
+    )
+
+    assert sensor_entity.available is True
+    assert sensor_entity.native_value == 3.40
+    attrs = sensor_entity.extra_state_attributes
+    assert attrs["total_cost"] == 3.40
+    assert attrs["latest_day_unassigned_kwh"] == 0.0
+    assert len(attrs["latest_day_periods"]) == 2
+    assert attrs["schedule_error"] is None
+
+
 def test_meter_info_sensor_exposes_meter_type_description() -> None:
     """Meter Info attributes surface the looked-up meter type description."""
 

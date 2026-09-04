@@ -29,6 +29,7 @@ from homeassistant.util.unit_conversion import EnergyConverter, VolumeConverter
 from .api import (
     build_billing_period_projection,
     build_latest_data_status,
+    calculated_cost_attributes,
     cost_attributes,
     service_id,
     usage_attributes,
@@ -317,6 +318,46 @@ def _build_usage_half_hourly_statistics(
     return statistics
 
 
+def _build_daily_cost_statistics(
+    daily_totals: list[dict[str, Any]],
+    *,
+    tzinfo: Any,
+) -> list[dict[str, Any]]:
+    """Build cumulative-sum daily cost statistics from net daily cost totals.
+
+    GloBird's cost detail is only published at daily resolution (no
+    half-hourly breakdown), so this statistic is daily-granularity, unlike
+    the half-hourly usage statistics.
+    """
+    rows = sorted(
+        (
+            row
+            for row in daily_totals
+            if isinstance(row, dict)
+            and _parse_portal_day(row.get("date")) is not None
+            and isinstance(row.get("amount"), (int, float))
+        ),
+        key=lambda row: str(row.get("date") or ""),
+    )
+    if not rows:
+        return []
+
+    statistics: list[dict[str, Any]] = []
+    cumulative_sum = 0.0
+    for row in rows:
+        day = _parse_portal_day(row["date"])
+        amount = float(row["amount"])
+        cumulative_sum += amount
+        statistics.append(
+            {
+                "start": datetime.combine(day, dt_time.min, tzinfo=tzinfo),
+                "state": round(amount, 2),
+                "sum": round(cumulative_sum, 2),
+            }
+        )
+    return statistics
+
+
 def _zerohero_last_result(
     summary: dict[str, Any],
 ) -> tuple[str, date | None, str | None]:
@@ -496,6 +537,7 @@ async def async_setup_entry(
                     ),
                     GloBirdCostTotalSensor(coordinator, config_entry, service),
                     GloBirdLatestDayCostSensor(coordinator, config_entry, service),
+                    GloBirdCalculatedCostSensor(coordinator, config_entry, service),
                     GloBirdZeroHeroStatusSensor(coordinator, config_entry, service),
                     GloBirdExpectedMonthlyCostSensor(
                         coordinator,
@@ -1140,6 +1182,95 @@ class GloBirdCostTotalSensor(GloBirdServiceBaseSensor):
     device_class = SensorDeviceClass.MONETARY
     state_class = None
 
+    async def async_added_to_hass(self) -> None:
+        """Upload historical daily cost to recorder long-term statistics."""
+        await super().async_added_to_hass()
+        await self._async_upload_historical_statistics()
+
+    def _handle_coordinator_update(self) -> None:
+        """Refresh the entity and import any newly published daily cost."""
+        super()._handle_coordinator_update()
+        self.hass.async_create_task(self._async_upload_historical_statistics())
+
+    async def _async_upload_historical_statistics(self) -> None:
+        """Import all cached net daily cost totals as external statistics.
+
+        Usable as the Energy Dashboard's cost statistic for the matching
+        usage statistic on the Recent Usage Total sensor. Daily resolution
+        only, since GloBird's cost detail is not published half-hourly.
+        """
+        summary = self._service_detail().get("cost_summary") or {}
+        daily_totals = summary.get("daily_totals")
+        if not isinstance(daily_totals, list) or not daily_totals:
+            _LOGGER.debug(
+                "GloBird cost statistics import skipped for %s (%s): "
+                "no daily cost totals available",
+                self._service_id,
+                getattr(self, "_attr_unique_id", self._service_id),
+            )
+            return
+
+        try:
+            from homeassistant.components.recorder.statistics import (
+                StatisticData,
+                StatisticMetaData,
+                async_add_external_statistics,
+            )
+        except ImportError:
+            return
+
+        statistics = [
+            StatisticData(**row)
+            for row in _build_daily_cost_statistics(
+                daily_totals,
+                tzinfo=dt_util.now().tzinfo or timezone.utc,
+            )
+        ]
+
+        if not statistics:
+            _LOGGER.debug(
+                "GloBird cost statistics import skipped for %s (%s): "
+                "no valid daily cost rows after parsing",
+                self._service_id,
+                getattr(self, "_attr_unique_id", self._service_id),
+            )
+            return
+
+        statistic_suffix = _safe_statistic_id(
+            getattr(self, "_attr_unique_id", self._service_id),
+            self._service_id,
+        )
+        statistic_id = f"{DOMAIN}:{statistic_suffix}"
+        metadata = StatisticMetaData(
+            has_mean=False,
+            mean_type=StatisticMeanType.NONE,
+            has_sum=True,
+            name=self._attr_name,
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_class=None,
+            unit_of_measurement=self.native_unit_of_measurement,
+        )
+        _LOGGER.debug(
+            "GloBird cost statistics prepared for %s (%s): %d rows from %s to %s",
+            self._service_id,
+            statistic_id,
+            len(statistics),
+            statistics[0]["start"].isoformat(),
+            statistics[-1]["start"].isoformat(),
+        )
+        try:
+            add_result = async_add_external_statistics(self.hass, metadata, statistics)
+            if isawaitable(add_result):
+                await add_result
+        except Exception as err:  # noqa: BLE001 - statistics import is best-effort.
+            _LOGGER.warning(
+                "GloBird cost statistics import skipped for %s (%s): %s",
+                self._service_id,
+                statistic_id,
+                err,
+            )
+
     @property
     def native_value(self) -> Any:
         """Return total recent cost."""
@@ -1185,6 +1316,53 @@ class GloBirdLatestDayCostSensor(GloBirdServiceBaseSensor):
                 ),
                 "zerohero_credit": summary.get("latest_day_zerohero_credit"),
             }
+        )
+        return attrs
+
+
+class GloBirdCalculatedCostSensor(GloBirdServiceBaseSensor):
+    """Estimated cost calculated from usage intervals and a user-configured
+    time-of-use rate schedule.
+
+    GloBird's API does not expose usable $/kWh rate data (verified against
+    both getProductsByAccountId and getAllProductHistoriesByAccountId, which
+    only return plan name/dates/flags, no rate figures), so this is
+    calculated locally from a rate schedule entered in integration options
+    and the already-deduplicated per-interval usage. Stays unavailable until
+    a schedule is configured.
+    """
+
+    sensor_key = "calculated_cost"
+    sensor_name = "Calculated TOU Cost"
+    icon = "mdi:calculator-variant"
+    native_unit_of_measurement = CURRENCY_AUD
+    device_class = SensorDeviceClass.MONETARY
+    state_class = None
+
+    @property
+    def available(self) -> bool:
+        """Only available once a TOU rate schedule is configured and valid.
+
+        Matches this integration's existing pattern elsewhere of trusting
+        cached/stale data rather than gating on coordinator update success.
+        """
+        summary = self._service_detail().get("calculated_cost_summary") or {}
+        return bool(summary.get("days"))
+
+    @property
+    def native_value(self) -> Any:
+        """Return the latest calculated day's total cost."""
+        summary = self._service_detail().get("calculated_cost_summary") or {}
+        return summary.get("latest_day_cost")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return calculated cost breakdown attributes."""
+        attrs = self._service_attrs()
+        summary = self._service_detail().get("calculated_cost_summary") or {}
+        attrs.update(calculated_cost_attributes(summary))
+        attrs["schedule_error"] = (self.coordinator.data or {}).get(
+            "tou_schedule_error"
         )
         return attrs
 

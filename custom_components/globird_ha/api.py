@@ -212,6 +212,23 @@ def cost_attributes(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def calculated_cost_attributes(summary: dict[str, Any]) -> dict[str, Any]:
+    """Return recorder-safe calculated (rate-schedule based) cost attributes."""
+    daily = summary.get("daily", [])
+    daily_rows = daily if isinstance(daily, list) else []
+    latest = daily_rows[-1] if daily_rows else None
+    return {
+        "days": summary.get("days", 0),
+        "latest_day": summary.get("latest_day"),
+        "total_cost": summary.get("total_cost"),
+        "latest_day_periods": latest.get("periods", []) if latest else [],
+        "latest_day_unassigned_kwh": latest.get("unassigned_kwh") if latest else None,
+        "daily": _recent_rows(daily_rows),
+        "daily_count": len(daily_rows),
+        "daily_truncated": len(daily_rows) > ATTR_RECENT_ROW_LIMIT,
+    }
+
+
 def extract_accounts_and_services(
     current_user_payload: dict[str, Any] | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -869,6 +886,180 @@ def _build_projected_month_summary(
         "completed_days": completed_days,
         "days_in_month": days_in_month,
         "latest_day": latest_day.isoformat(),
+    }
+
+
+def _parse_clock_minutes(value: Any) -> int:
+    """Parse an HH:MM clock string into minutes since midnight (24:00 -> 1440)."""
+    raw = str(value).strip()
+    parts = raw.split(":")
+    if len(parts) < 2:
+        raise ValueError(f"Invalid time '{value}'")
+    hour = int(parts[0])
+    minute = int(parts[1])
+    if hour == 24 and minute == 0:
+        return 1440
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"Invalid time '{value}'")
+    return hour * 60 + minute
+
+
+def parse_tou_rate_schedule(raw: str | None) -> dict[str, Any] | None:
+    """Parse and validate a user-configured time-of-use rate schedule.
+
+    GloBird's API does not expose usable $/kWh rate data, so a schedule
+    entered from the customer's own contract/bill is the only source. Expected
+    shape (rates in $/kWh, supply_charge in $/day, windows as [start, end)
+    24-hour clock pairs, "24:00" meaning midnight at the end of the day)::
+
+        {
+            "supply_charge": 1.12,
+            "periods": [
+                {"name": "Offpeak Usage", "rate": 0.28,
+                 "windows": [["00:00", "15:00"], ["21:00", "24:00"]]},
+                {"name": "Peak Usage", "rate": 0.45,
+                 "windows": [["15:00", "21:00"]]}
+            ]
+        }
+
+    `name` should match the usage register's chargeType (e.g. "Peak Usage")
+    so the breakdown lines up with what the portal itself reports, but it is
+    only used as a label here - the windows are what select the rate.
+
+    Returns None when raw is empty/not configured. Raises ValueError for
+    malformed input so callers can surface a clear config error.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("TOU rate schedule must be a JSON object")
+
+    periods_raw = parsed.get("periods")
+    if not isinstance(periods_raw, list) or not periods_raw:
+        raise ValueError("TOU rate schedule must include a non-empty 'periods' list")
+
+    periods: list[dict[str, Any]] = []
+    for period in periods_raw:
+        if not isinstance(period, dict):
+            raise ValueError("Each TOU period must be a JSON object")
+        name = str(period.get("name") or "").strip()
+        rate = _as_float(period.get("rate"))
+        windows_raw = period.get("windows")
+        if (
+            not name
+            or rate is None
+            or not isinstance(windows_raw, list)
+            or not windows_raw
+        ):
+            raise ValueError(f"Invalid TOU period: {period!r}")
+
+        windows: list[tuple[int, int]] = []
+        for window in windows_raw:
+            if not isinstance(window, (list, tuple)) or len(window) != 2:
+                raise ValueError(f"Invalid TOU window: {window!r}")
+            start = _parse_clock_minutes(window[0])
+            end = _parse_clock_minutes(window[1])
+            if end <= start:
+                raise ValueError(f"TOU window end must be after start: {window!r}")
+            windows.append((start, end))
+
+        periods.append({"name": name, "rate": rate, "windows": windows})
+
+    supply_charge = _as_float(parsed.get("supply_charge")) or 0.0
+    return {"supply_charge": supply_charge, "periods": periods}
+
+
+def calculate_tou_cost(
+    intervals_by_day: list[dict[str, Any]],
+    schedule: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Calculate estimated daily cost from interval usage and a TOU rate schedule."""
+    empty: dict[str, Any] = {
+        "days": 0,
+        "daily": [],
+        "latest_day": None,
+        "latest_day_cost": None,
+        "total_cost": None,
+    }
+    if not schedule or not isinstance(intervals_by_day, list):
+        return empty
+
+    periods = schedule.get("periods") or []
+    supply_charge = schedule.get("supply_charge") or 0.0
+
+    daily: list[dict[str, Any]] = []
+    for row in intervals_by_day:
+        if not isinstance(row, dict):
+            continue
+        read_date = row.get("readDate")
+        intervals = row.get("intervals")
+        if not read_date or not isinstance(intervals, list) or not intervals:
+            continue
+
+        minutes_per_interval = 1440 // len(intervals)
+        period_totals: dict[str, dict[str, Any]] = {
+            period["name"]: {"kwh": 0.0, "cost": 0.0, "rate": period["rate"]}
+            for period in periods
+        }
+        unassigned_kwh = 0.0
+
+        for index, value in enumerate(intervals):
+            usage = _as_float(value) or 0.0
+            interval_start = index * minutes_per_interval
+            matched = next(
+                (
+                    period
+                    for period in periods
+                    if any(
+                        start <= interval_start < end
+                        for start, end in period["windows"]
+                    )
+                ),
+                None,
+            )
+            if matched is None:
+                unassigned_kwh += usage
+                continue
+            bucket = period_totals[matched["name"]]
+            bucket["kwh"] += usage
+            bucket["cost"] += usage * matched["rate"]
+
+        usage_cost = sum(bucket["cost"] for bucket in period_totals.values())
+        total_cost = usage_cost + supply_charge
+
+        daily.append(
+            {
+                "readDate": read_date,
+                "total_cost": _round(total_cost, 2),
+                "usage_cost": _round(usage_cost, 2),
+                "supply_charge": _round(supply_charge, 2),
+                "unassigned_kwh": _round(unassigned_kwh, 3),
+                "periods": [
+                    {
+                        "name": name,
+                        "kwh": _round(bucket["kwh"], 3),
+                        "cost": _round(bucket["cost"], 2),
+                        "rate": bucket["rate"],
+                    }
+                    for name, bucket in period_totals.items()
+                ],
+            }
+        )
+
+    if not daily:
+        return empty
+
+    daily.sort(key=lambda row: row["readDate"])
+    latest = daily[-1]
+    return {
+        "days": len(daily),
+        "daily": daily,
+        "latest_day": latest["readDate"],
+        "latest_day_cost": latest["total_cost"],
+        "total_cost": _round(sum(row["total_cost"] for row in daily), 2),
     }
 
 

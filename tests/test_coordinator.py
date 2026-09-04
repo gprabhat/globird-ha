@@ -249,6 +249,7 @@ def test_gas_service_fetches_its_own_meter_and_forces_basic_endpoint() -> None:
             },
             None,
             None,
+            None,
             {},
         )
     )
