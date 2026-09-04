@@ -152,6 +152,7 @@ def usage_attributes(
     *,
     direction: str,
     include_latest_intervals: bool = False,
+    include_intervals_by_day: bool = False,
 ) -> dict[str, Any]:
     """Return recorder-safe usage attributes for import or export sensors."""
     daily_key = "export_daily" if direction == "export" else "daily"
@@ -173,6 +174,16 @@ def usage_attributes(
     }
     if include_latest_intervals:
         attrs["latest_intervals"] = summary.get("latest_intervals", [])
+    if include_intervals_by_day:
+        intervals_by_day = summary.get("intervals_by_day", [])
+        intervals_by_day_rows = (
+            intervals_by_day if isinstance(intervals_by_day, list) else []
+        )
+        attrs["intervals_by_day"] = _recent_rows(intervals_by_day_rows)
+        attrs["intervals_by_day_count"] = len(intervals_by_day_rows)
+        attrs["intervals_by_day_truncated"] = (
+            len(intervals_by_day_rows) > ATTR_RECENT_ROW_LIMIT
+        )
     return attrs
 
 
@@ -197,6 +208,7 @@ def cost_attributes(summary: dict[str, Any]) -> dict[str, Any]:
         "available_daily_count": len(available_rows),
         "available_daily_truncated": len(available_rows) > ATTR_RECENT_ROW_LIMIT,
         "categories": summary.get("categories", []),
+        "charge_type_totals": summary.get("charge_type_totals", []),
     }
 
 
@@ -304,6 +316,19 @@ def _meter_type_rank(meter: dict[str, Any]) -> int:
     return 0
 
 
+def meter_type_description(
+    meter_types_payload: dict[str, Any] | None,
+    serial_number: Any,
+) -> str | None:
+    """Look up a human-readable meter type (e.g. 'Smart') by serial number."""
+    if not serial_number:
+        return None
+    lookup = _payload_data(meter_types_payload)
+    if not isinstance(lookup, dict):
+        return None
+    return lookup.get(str(serial_number))
+
+
 def select_meter_for_service(
     service: dict[str, Any],
     meters_payload: dict[str, Any] | None,
@@ -355,9 +380,13 @@ def _build_register_summary(
 ) -> dict[str, Any]:
     """Summarise a list of usage rows for a single register (E1 or B1).
 
-    Each day has multiple rows (one per time-of-use period). Group by date
-    so that daily totals and latest_day_usage are correct sums, not a single
-    time-of-use period's value.
+    Each day has multiple rows (one per time-of-use period, e.g. Peak/Offpeak).
+    Group by date so that daily totals and latest_day_usage are correct sums,
+    not a single time-of-use period's value. The portal attaches the *same*
+    full-day usageArray to every time-of-use row for a given suffix (only the
+    scalar `usage` differs per period), so interval arrays must be taken once
+    per (date, suffix) pair rather than summed across TOU rows, or they end
+    up double- (or triple-) counted for time-of-use tariffs.
     """
     if not rows:
         return {
@@ -371,6 +400,7 @@ def _build_register_summary(
 
     # Group rows by date
     by_date: dict[str, dict[str, Any]] = {}
+    seen_interval_keys: set[tuple[str, str]] = set()
     for row in rows:
         d = row.get("readDate") or ""
         usage = _as_float(row.get("usage")) or 0.0
@@ -383,9 +413,15 @@ def _build_register_summary(
                 "intervals": None,
             }
         by_date[d]["usage"] += usage
-        # Element-wise sum of usageArrays across all time-of-use periods for the day
+
         arr = row.get("usageArray")
-        if isinstance(arr, list) and arr:
+        interval_key = (d, str(row.get("suffix") or ""))
+        if (
+            isinstance(arr, list)
+            and arr
+            and interval_key not in seen_interval_keys
+        ):
+            seen_interval_keys.add(interval_key)
             existing = by_date[d]["intervals"]
             if existing is None:
                 by_date[d]["intervals"] = list(arr)
@@ -414,6 +450,15 @@ def _build_register_summary(
     if latest_entry and isinstance(latest_entry["intervals"], list):
         latest_intervals = [_round(_as_float(v), 5) for v in latest_entry["intervals"]]
 
+    intervals_by_day = [
+        {
+            "readDate": v["readDate"],
+            "intervals": [_round(_as_float(x), 5) for x in v["intervals"]],
+        }
+        for v in sorted(by_date.values(), key=lambda x: x["readDate"])
+        if isinstance(v["intervals"], list)
+    ]
+
     return {
         "days": len(by_date),
         "total": _round(total),
@@ -421,6 +466,7 @@ def _build_register_summary(
         "latest_day_usage": _round(latest_entry["usage"]) if latest_entry else None,
         "daily": daily,
         "latest_intervals": latest_intervals,
+        "intervals_by_day": intervals_by_day,
     }
 
 
@@ -494,6 +540,7 @@ def build_usage_summary(
             "latest_day_usage": None,
             "daily": [],
             "latest_intervals": [],
+            "intervals_by_day": [],
             "total_export": None,
             "latest_day_export": None,
             "export_daily": [],
@@ -513,6 +560,7 @@ def build_usage_summary(
         "latest_day_usage": import_summary["latest_day_usage"],
         "daily": import_summary["daily"],
         "latest_intervals": import_summary["latest_intervals"],
+        "intervals_by_day": import_summary["intervals_by_day"],
         "total_export": export_summary["total"],
         "latest_day_export": export_summary["latest_day_usage"],
         "export_daily": export_summary["daily"],
@@ -587,6 +635,7 @@ def build_cost_summary(cost_payload: dict[str, Any] | None) -> dict[str, Any]:
     daily_totals: dict[str, float] = {}
     available_daily: list[dict[str, Any]] = []
     categories: dict[str, dict[str, Any]] = {}
+    charge_types: dict[str, dict[str, Any]] = {}
     total_amount = 0.0
     total_quantity = 0.0
     grouped_rows: dict[str, list[dict[str, Any]]] = {}
@@ -630,6 +679,19 @@ def build_cost_summary(cost_payload: dict[str, Any] | None) -> dict[str, Any]:
             }
         categories[category]["amount"] += amount
         categories[category]["quantity"] += quantity
+
+        charge_type = row.get("chargeType")
+        if charge_type:
+            charge_type_key = str(charge_type).strip()
+            if charge_type_key not in charge_types:
+                charge_types[charge_type_key] = {
+                    "chargeType": charge_type,
+                    "amount": 0.0,
+                    "quantity": 0.0,
+                }
+            charge_types[charge_type_key]["amount"] += amount
+            charge_types[charge_type_key]["quantity"] += quantity
+
         daily.append(item)
 
     # GloBird returns multiple rows per day (SOLAR, USAGE, SUPPLY, etc.). Sum all
@@ -677,6 +739,14 @@ def build_cost_summary(cost_payload: dict[str, Any] | None) -> dict[str, Any]:
                 "quantity": _round(value["quantity"]),
             }
             for _, value in sorted(categories.items())
+        ],
+        "charge_type_totals": [
+            {
+                "chargeType": value["chargeType"],
+                "amount": _round(value["amount"], 2),
+                "quantity": _round(value["quantity"]),
+            }
+            for _, value in sorted(charge_types.items())
         ],
     }
 

@@ -24,7 +24,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
-from homeassistant.util.unit_conversion import VolumeConverter
+from homeassistant.util.unit_conversion import EnergyConverter, VolumeConverter
 
 from .api import (
     build_billing_period_projection,
@@ -277,6 +277,46 @@ def _build_gas_statistics(
     return [by_day[day] for day in sorted(by_day)]
 
 
+def _build_usage_half_hourly_statistics(
+    intervals_by_day: list[dict[str, Any]],
+    *,
+    tzinfo: Any,
+) -> list[dict[str, Any]]:
+    """Build cumulative-sum statistics from per-day half-hourly usage intervals."""
+    rows = sorted(
+        (
+            row
+            for row in intervals_by_day
+            if isinstance(row, dict)
+            and _parse_portal_day(row.get("readDate")) is not None
+            and isinstance(row.get("intervals"), list)
+            and row.get("intervals")
+        ),
+        key=lambda row: str(row.get("readDate") or ""),
+    )
+    if not rows:
+        return []
+
+    statistics: list[dict[str, Any]] = []
+    cumulative_sum = 0.0
+    for row in rows:
+        day = _parse_portal_day(row["readDate"])
+        intervals = row["intervals"]
+        minutes_per_interval = 1440 // len(intervals)
+        day_start = datetime.combine(day, dt_time.min, tzinfo=tzinfo)
+        for index, value in enumerate(intervals):
+            usage = float(value) if isinstance(value, (int, float)) else 0.0
+            cumulative_sum += usage
+            statistics.append(
+                {
+                    "start": day_start + timedelta(minutes=index * minutes_per_interval),
+                    "state": round(usage, 5),
+                    "sum": round(cumulative_sum, 5),
+                }
+            )
+    return statistics
+
+
 def _zerohero_last_result(
     summary: dict[str, Any],
 ) -> tuple[str, date | None, str | None]:
@@ -319,6 +359,11 @@ def _next_zerohero_status_boundary(now: datetime) -> datetime:
 
 def _refresh_status_value(data: dict[str, Any]) -> str:
     return "error" if data.get("refresh_error") else "ok"
+
+
+def _weather_impacted_days_value(data: dict[str, Any]) -> Any:
+    payload = _payload_data(data.get("weather_impacted_days")) or {}
+    return payload.get("numberOfImpactedDays")
 
 
 def _refresh_status_attrs(data: dict[str, Any]) -> dict[str, Any]:
@@ -378,6 +423,12 @@ GLOBAL_SENSORS: tuple[GloBirdSensorDescription, ...] = (
         value_fn=_signup_services_value,
         attrs_fn=_signup_services_attrs,
         icon="mdi:transmission-tower",
+    ),
+    GloBirdSensorDescription(
+        key="weather_impacted_days",
+        name="Weather Impacted Days",
+        value_fn=_weather_impacted_days_value,
+        icon="mdi:weather-lightning-rainy",
     ),
     GloBirdSensorDescription(
         key="last_successful_refresh",
@@ -653,7 +704,9 @@ class GloBirdMeterInfoSensor(GloBirdServiceBaseSensor):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return meter attributes."""
         attrs = self._service_attrs()
-        attrs["meter"] = self._service_detail().get("meter")
+        detail = self._service_detail()
+        attrs["meter"] = detail.get("meter")
+        attrs["meter_type_description"] = detail.get("meter_type_description")
         return attrs
 
 
@@ -891,6 +944,90 @@ class GloBirdUsageTotalSensor(GloBirdServiceBaseSensor):
     device_class = SensorDeviceClass.ENERGY
     state_class = SensorStateClass.TOTAL
 
+    async def async_added_to_hass(self) -> None:
+        """Upload historical half-hourly usage to recorder long-term statistics."""
+        await super().async_added_to_hass()
+        await self._async_upload_historical_statistics()
+
+    def _handle_coordinator_update(self) -> None:
+        """Refresh the entity and import any newly published usage intervals."""
+        super()._handle_coordinator_update()
+        self.hass.async_create_task(self._async_upload_historical_statistics())
+
+    async def _async_upload_historical_statistics(self) -> None:
+        """Import all cached half-hourly usage as external statistics."""
+        summary = self._service_detail().get("usage_summary") or {}
+        intervals_by_day = summary.get("intervals_by_day")
+        if not isinstance(intervals_by_day, list) or not intervals_by_day:
+            _LOGGER.debug(
+                "GloBird usage statistics import skipped for %s (%s): "
+                "no interval data available",
+                self._service_id,
+                getattr(self, "_attr_unique_id", self._service_id),
+            )
+            return
+
+        try:
+            from homeassistant.components.recorder.statistics import (
+                StatisticData,
+                StatisticMetaData,
+                async_add_external_statistics,
+            )
+        except ImportError:
+            return
+
+        statistics = [
+            StatisticData(**row)
+            for row in _build_usage_half_hourly_statistics(
+                intervals_by_day,
+                tzinfo=dt_util.now().tzinfo or timezone.utc,
+            )
+        ]
+
+        if not statistics:
+            _LOGGER.debug(
+                "GloBird usage statistics import skipped for %s (%s): "
+                "no valid interval rows after parsing",
+                self._service_id,
+                getattr(self, "_attr_unique_id", self._service_id),
+            )
+            return
+
+        statistic_suffix = _safe_statistic_id(
+            getattr(self, "_attr_unique_id", self._service_id),
+            self._service_id,
+        )
+        statistic_id = f"{DOMAIN}:{statistic_suffix}"
+        metadata = StatisticMetaData(
+            has_mean=False,
+            mean_type=StatisticMeanType.NONE,
+            has_sum=True,
+            name=self._attr_name,
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_class=EnergyConverter.UNIT_CLASS,
+            unit_of_measurement=self.native_unit_of_measurement,
+        )
+        _LOGGER.debug(
+            "GloBird usage statistics prepared for %s (%s): %d rows from %s to %s",
+            self._service_id,
+            statistic_id,
+            len(statistics),
+            statistics[0]["start"].isoformat(),
+            statistics[-1]["start"].isoformat(),
+        )
+        try:
+            add_result = async_add_external_statistics(self.hass, metadata, statistics)
+            if isawaitable(add_result):
+                await add_result
+        except Exception as err:  # noqa: BLE001 - statistics import is best-effort.
+            _LOGGER.warning(
+                "GloBird usage statistics import skipped for %s (%s): %s",
+                self._service_id,
+                statistic_id,
+                err,
+            )
+
     @property
     def native_value(self) -> Any:
         """Return total recent usage."""
@@ -901,7 +1038,13 @@ class GloBirdUsageTotalSensor(GloBirdServiceBaseSensor):
         """Return usage summary attributes."""
         attrs = self._service_attrs()
         summary = self._service_detail().get("usage_summary") or {}
-        attrs.update(usage_attributes(summary, direction="import"))
+        attrs.update(
+            usage_attributes(
+                summary,
+                direction="import",
+                include_intervals_by_day=True,
+            )
+        )
         return attrs
 
 

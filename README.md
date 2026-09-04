@@ -1,7 +1,7 @@
 # GloBird HA
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
-[![Validate](https://github.com/bolagnaise/globird-ha/actions/workflows/validate.yaml/badge.svg)](https://github.com/bolagnaise/globird-ha/actions/workflows/validate.yaml)
+[![Validate](https://github.com/gprabhat/globird-ha/actions/workflows/validate.yaml/badge.svg)](https://github.com/gprabhat/globird-ha/actions/workflows/validate.yaml)
 
 Read-only Home Assistant custom integration for the GloBird Energy customer portal.
 
@@ -13,12 +13,12 @@ This integration logs in to `https://myaccount.globirdenergy.com.au` and exposes
 
 1. Open HACS in Home Assistant.
 2. Go to **Custom repositories**.
-3. Add `https://github.com/bolagnaise/globird-ha` as an **Integration** repository.
+3. Add `https://github.com/gprabhat/globird-ha` as an **Integration** repository.
 4. Install **GloBird HA** from HACS.
 5. Restart Home Assistant.
 6. Add the integration from **Settings > Devices & services > Add integration > GloBird HA**.
 
-[Open this repository in HACS](https://my.home-assistant.io/redirect/hacs_repository/?owner=bolagnaise&repository=globird-ha&category=integration)
+[Open this repository in HACS](https://my.home-assistant.io/redirect/hacs_repository/?owner=gprabhat&repository=globird-ha&category=integration)
 
 If **GloBird HA** does not appear in the Add integration search after installing through HACS:
 
@@ -45,6 +45,7 @@ Account-level sensors include:
 - Dashboard balance and recent transactions
 - Latest invoice
 - Signup services
+- Weather impacted days
 - Last successful refresh
 - Refresh status
 - One account summary sensor per returned account
@@ -74,9 +75,13 @@ Gas service-level sensors include:
 - Latest gas reading
 - Latest gas reading date
 
-Recorder-safe daily summaries, the latest interval array, compact usage register totals, cost category totals, daily net cost totals, and incomplete cost days are exposed as sensor attributes. Daily usage and cost attributes keep the most recent rows and include count/truncation flags; full cached snapshots are available through Home Assistant diagnostics with sensitive fields redacted.
+Recorder-safe daily summaries, the latest interval array, a recent window of per-day half-hourly interval breakdowns, compact usage register totals (including any time-of-use split such as Peak/Offpeak), cost category totals, a cost breakdown by time-of-use charge type when the portal provides one, daily net cost totals, and incomplete cost days are exposed as sensor attributes. Daily usage and cost attributes keep the most recent rows and include count/truncation flags; full cached snapshots are available through Home Assistant diagnostics with sensitive fields redacted. Meter Info exposes a human-readable meter type description (e.g. "Smart") alongside the raw meter row.
 
 For gas services, historical basic-meter readings are also imported into Home Assistant recorder long-term statistics so historical charts can be populated from existing portal read history. Meter replacements and corrected lower reads are handled without losing subsequent consumption.
+
+For electricity import usage, smart-meter intervals across the cached usage window (up to 31 days) are imported into Home Assistant recorder long-term statistics under the Recent Usage Total sensor, at whatever resolution the portal reports them (commonly every 5 or 30 minutes depending on the meter). This lets the built-in Energy Dashboard show real consumption shape through the day, not just daily totals, and backfills as far back as GloBird has published interval data. Like all GloBird data, this trails the portal by roughly a day. Solar export intervals are not currently imported into statistics, only into daily totals.
+
+The portal attaches the same full-day interval array to every time-of-use row (e.g. Peak and Offpeak) for a meter, with only the billed portion differing per row; the integration counts each day's interval array once per meter register rather than once per time-of-use row, so time-of-use accounts don't get their interval data double-counted.
 
 ## Updates and data freshness
 

@@ -593,6 +593,109 @@ def test_usage_summary_tracks_all_registers_and_b_exports() -> None:
     assert usage["registers"][3]["direction"] == "export"
 
 
+def test_usage_summary_retains_intervals_for_every_day() -> None:
+    """Half-hourly intervals are kept for all fetched days, not just the latest."""
+    payload = {
+        "data": [
+            {
+                "readDate": "2026-04-23",
+                "usage": 3.0,
+                "suffix": "E1",
+                "chargeType": "Peak",
+                "chargeCategoryCode": "USAGE",
+                "usageArray": [1.0, 2.0],
+            },
+            {
+                "readDate": "2026-04-24",
+                "usage": 5.0,
+                "suffix": "E1",
+                "chargeType": "Peak",
+                "chargeCategoryCode": "USAGE",
+                "usageArray": [2.0, 3.0],
+            },
+        ],
+        "message": None,
+        "success": True,
+    }
+
+    usage = build_usage_summary(payload)
+
+    assert usage["intervals_by_day"] == [
+        {"readDate": "2026-04-23", "intervals": [1.0, 2.0]},
+        {"readDate": "2026-04-24", "intervals": [2.0, 3.0]},
+    ]
+    # The latest-day-only attribute keeps working alongside the new full history.
+    assert usage["latest_intervals"] == [2.0, 3.0]
+
+
+def test_usage_attributes_expose_recent_intervals_by_day_when_requested() -> None:
+    """intervals_by_day is recorder-safe (truncated) and opt-in via a flag."""
+    payload = {
+        "data": [
+            {
+                "readDate": (date(2026, 4, 1) + timedelta(days=offset)).isoformat(),
+                "usage": 1.0,
+                "suffix": "E1",
+                "chargeType": "Peak",
+                "chargeCategoryCode": "USAGE",
+                "usageArray": [0.1] * 48,
+            }
+            for offset in range(10)
+        ],
+    }
+    summary = build_usage_summary(payload)
+
+    without_intervals = usage_attributes(summary, direction="import")
+    assert "intervals_by_day" not in without_intervals
+
+    with_intervals = usage_attributes(
+        summary, direction="import", include_intervals_by_day=True
+    )
+    assert with_intervals["intervals_by_day_count"] == 10
+    assert with_intervals["intervals_by_day_truncated"] is True
+    assert len(with_intervals["intervals_by_day"]) == 7
+    assert len(json.dumps(with_intervals)) < 16_384
+
+
+def test_usage_intervals_are_not_double_counted_across_tou_periods() -> None:
+    """The portal attaches the same full-day array to every TOU row for a
+    suffix; only the first occurrence per (date, suffix) should be counted,
+    or interval sums silently double for time-of-use tariffs."""
+    payload = {
+        "data": [
+            {
+                "readDate": "2026-09-01",
+                "usage": 2.482,
+                "suffix": "E1",
+                "chargeType": "Offpeak Usage",
+                "chargeCategoryCode": "USAGE",
+                "usageArray": [0.02, 0.024, 0.007],
+            },
+            {
+                "readDate": "2026-09-01",
+                "usage": 2.183,
+                "suffix": "E1",
+                "chargeType": "Peak Usage",
+                "chargeCategoryCode": "USAGE",
+                # Portal duplicates the same full-day array on every TOU row.
+                "usageArray": [0.02, 0.024, 0.007],
+            },
+        ],
+        "message": None,
+        "success": True,
+    }
+
+    usage = build_usage_summary(payload)
+
+    # Scalar usage totals correctly sum each TOU period's own portion.
+    assert usage["latest_day_usage"] == 4.665
+    # But the interval array must only be counted once, not once per TOU row.
+    assert usage["latest_intervals"] == [0.02, 0.024, 0.007]
+    assert usage["intervals_by_day"] == [
+        {"readDate": "2026-09-01", "intervals": [0.02, 0.024, 0.007]}
+    ]
+
+
 def test_cost_summary_exposes_new_category_totals() -> None:
     """Cost summaries preserve newer GloBird categories separately."""
     payload = {
@@ -638,6 +741,77 @@ def test_cost_summary_exposes_new_category_totals() -> None:
         {"chargeCategory": "USAGE", "amount": 1.2, "quantity": 3.0},
         {"chargeCategory": "ZEROHERO Credit", "amount": -0.3, "quantity": 0.0},
     ]
+
+
+def test_cost_summary_breaks_down_by_charge_type() -> None:
+    """Time-of-use charge types (Peak/Offpeak) are totalled separately when present."""
+    payload = {
+        "data": [
+            {
+                "chargeCategory": "USAGE",
+                "chargeType": "Peak Usage",
+                "date": "2026/09/01",
+                "amount": 2.18,
+                "quantity": 2.183,
+            },
+            {
+                "chargeCategory": "USAGE",
+                "chargeType": "Offpeak Usage",
+                "date": "2026/09/01",
+                "amount": 1.24,
+                "quantity": 2.482,
+            },
+            {
+                "chargeCategory": "SUPPLY",
+                "chargeType": None,
+                "date": "2026/09/01",
+                "amount": 1.12,
+                "quantity": 0.0,
+            },
+        ],
+        "message": None,
+        "success": True,
+    }
+
+    cost = build_cost_summary(payload)
+
+    assert cost["charge_type_totals"] == [
+        {"chargeType": "Offpeak Usage", "amount": 1.24, "quantity": 2.482},
+        {"chargeType": "Peak Usage", "amount": 2.18, "quantity": 2.183},
+    ]
+    assert cost_attributes(cost)["charge_type_totals"] == cost["charge_type_totals"]
+
+
+def test_cost_summary_charge_type_totals_empty_when_type_missing() -> None:
+    """Flat-rate plans with no chargeType on cost rows degrade to an empty list."""
+    payload = {
+        "data": [
+            {
+                "chargeCategory": "USAGE",
+                "chargeType": None,
+                "date": "2026/09/01",
+                "amount": 3.42,
+                "quantity": 4.665,
+            },
+        ],
+        "message": None,
+        "success": True,
+    }
+
+    cost = build_cost_summary(payload)
+
+    assert cost["charge_type_totals"] == []
+
+
+def test_meter_type_description_looks_up_by_serial() -> None:
+    """Meter type descriptions are looked up by serial number, and missing serials are safe."""
+    payload = {"data": {"700594829": "Smart", "080625": "Manually read interval"}}
+
+    assert api.meter_type_description(payload, "700594829") == "Smart"
+    assert api.meter_type_description(payload, "080625") == "Manually read interval"
+    assert api.meter_type_description(payload, "unknown-serial") is None
+    assert api.meter_type_description(payload, None) is None
+    assert api.meter_type_description(None, "700594829") is None
 
 
 def test_cost_summary_exposes_daily_net_totals() -> None:
@@ -833,6 +1007,12 @@ def load_tests(
         test_cost_summary_net_daily_is_sum_not_last_row,
         test_cost_summary_ignores_supply_only_partial_latest_day,
         test_usage_summary_tracks_all_registers_and_b_exports,
+        test_usage_summary_retains_intervals_for_every_day,
+        test_usage_attributes_expose_recent_intervals_by_day_when_requested,
+        test_usage_intervals_are_not_double_counted_across_tou_periods,
+        test_cost_summary_breaks_down_by_charge_type,
+        test_cost_summary_charge_type_totals_empty_when_type_missing,
+        test_meter_type_description_looks_up_by_serial,
         test_cost_summary_exposes_new_category_totals,
         test_cost_summary_projects_current_month_cost,
         test_sensor_attributes_are_recorder_safe_summaries,

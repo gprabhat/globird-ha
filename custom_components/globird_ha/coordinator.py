@@ -22,6 +22,7 @@ from .api import (
     build_usage_summary,
     build_weather_summary,
     extract_accounts_and_services,
+    meter_type_description,
     select_meter_for_service,
     service_id,
 )
@@ -294,6 +295,7 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     service,
                     data.get("read_meters"),
                     data.get("service_status"),
+                    data.get("meter_types"),
                     cached_detail if isinstance(cached_detail, dict) else {},
                 )
 
@@ -323,6 +325,7 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         service: dict[str, Any],
         meters_payload: dict[str, Any] | None,
         status_payload: dict[str, Any] | None,
+        meter_types_payload: dict[str, Any] | None,
         cache: dict[str, Any],
     ) -> dict[str, Any]:
         """Fetch heavier per-service detail."""
@@ -402,6 +405,9 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "service": service,
             "status": service_status,
             "meter": meter,
+            "meter_type_description": meter_type_description(
+                meter_types_payload, serial_number
+            ),
             "read_meters": service_meters,
             "usage": usage,
             "usage_summary": usage_summary,

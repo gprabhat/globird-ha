@@ -141,6 +141,7 @@ update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
 update_coordinator.UpdateFailed = UpdateFailed
 recorder_models.StatisticMeanType = StatisticMeanType
 unit_conversion.VolumeConverter = types.SimpleNamespace(UNIT_CLASS="volume")
+unit_conversion.EnergyConverter = types.SimpleNamespace(UNIT_CLASS="energy")
 dt.now = lambda: datetime.now(timezone.utc)
 util.dt = dt
 util.unit_conversion = unit_conversion
@@ -426,6 +427,109 @@ def test_gas_statistics_ignore_downward_correction_without_double_counting() -> 
     )
 
     assert [row["sum"] for row in statistics] == [100.0, 100.0, 102.0]
+
+
+def test_usage_half_hourly_statistics_accumulate_across_days() -> None:
+    """Each half-hour interval becomes a statistic row with a running sum."""
+    local_tz = timezone(timedelta(hours=10))
+    statistics = sensor._build_usage_half_hourly_statistics(
+        [
+            {"readDate": "2026-04-23", "intervals": [0.1] * 48},
+            {"readDate": "2026-04-24", "intervals": [0.5, 1.5] + [0.0] * 46},
+        ],
+        tzinfo=local_tz,
+    )
+
+    assert len(statistics) == 96
+    assert [row["state"] for row in statistics[:3]] == [0.1, 0.1, 0.1]
+    assert statistics[47]["sum"] == 4.8
+    assert statistics[48]["sum"] == 5.3
+    assert statistics[49]["sum"] == 6.8
+    assert statistics[0]["start"] == datetime(2026, 4, 23, 0, 0, tzinfo=local_tz)
+    assert statistics[1]["start"] == datetime(2026, 4, 23, 0, 30, tzinfo=local_tz)
+    assert statistics[48]["start"] == datetime(2026, 4, 24, 0, 0, tzinfo=local_tz)
+    assert statistics[49]["start"] == datetime(2026, 4, 24, 0, 30, tzinfo=local_tz)
+
+
+def test_usage_half_hourly_statistics_skip_days_without_intervals() -> None:
+    """Rows missing a parseable date or interval array are ignored, not errored."""
+    statistics = sensor._build_usage_half_hourly_statistics(
+        [
+            {"readDate": "not-a-date", "intervals": [1.0]},
+            {"readDate": "2026-04-24", "intervals": []},
+            {"readDate": "2026-04-25", "intervals": [1.0, 2.0]},
+        ],
+        tzinfo=timezone.utc,
+    )
+
+    assert len(statistics) == 2
+    assert statistics[0]["sum"] == 1.0
+
+
+def test_usage_total_sensor_exposes_recent_intervals_by_day() -> None:
+    """Recent Usage Total attributes include a truncated intervals_by_day window."""
+
+    class FakeCoordinator:
+        data = {
+            "service_data": {
+                "svc-1": {
+                    "usage_summary": {
+                        "total_usage": 10.0,
+                        "intervals_by_day": [
+                            {"readDate": "2026-04-24", "intervals": [1.0, 2.0]}
+                        ],
+                        "daily": [],
+                        "registers": [],
+                    },
+                }
+            }
+        }
+
+    sensor_entity = sensor.GloBirdUsageTotalSensor(
+        FakeCoordinator(),
+        types.SimpleNamespace(entry_id="entry-1"),
+        {"accountServiceId": "svc-1", "siteIdentifier": "svc-1"},
+    )
+
+    attrs = sensor_entity.extra_state_attributes
+    assert attrs["intervals_by_day"] == [
+        {"readDate": "2026-04-24", "intervals": [1.0, 2.0]}
+    ]
+    assert attrs["intervals_by_day_count"] == 1
+    assert attrs["intervals_by_day_truncated"] is False
+
+
+def test_meter_info_sensor_exposes_meter_type_description() -> None:
+    """Meter Info attributes surface the looked-up meter type description."""
+
+    class FakeCoordinator:
+        data = {
+            "service_data": {
+                "svc-1": {
+                    "meter": {"meterReadType": "SMART", "serialStatus": "Energized"},
+                    "meter_type_description": "Smart",
+                }
+            }
+        }
+
+    sensor_entity = sensor.GloBirdMeterInfoSensor(
+        FakeCoordinator(),
+        types.SimpleNamespace(entry_id="entry-1"),
+        {"accountServiceId": "svc-1", "siteIdentifier": "svc-1", "serviceType": "Power"},
+    )
+
+    assert sensor_entity.extra_state_attributes["meter_type_description"] == "Smart"
+
+
+def test_weather_impacted_days_sensor_reads_numeric_value() -> None:
+    """Weather Impacted Days surfaces numberOfImpactedDays from the account payload."""
+    description = next(
+        d for d in sensor.GLOBAL_SENSORS if d.key == "weather_impacted_days"
+    )
+
+    data = {"weather_impacted_days": {"data": {"numberOfImpactedDays": 3}}}
+    assert description.value_fn(data) == 3
+    assert description.value_fn({}) is None
 
 
 def test_latest_gas_reading_sensor_exposes_reading_summary() -> None:
