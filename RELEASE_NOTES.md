@@ -1,5 +1,3 @@
-## v0.1.43
+## v0.1.44
 
-- Import net daily cost into recorder long-term statistics via the Recent Cost Total sensor, so it can be paired with the Recent Usage Total statistic as the Energy Dashboard's grid consumption cost stat. Daily resolution only, since GloBird does not publish half-hourly cost detail.
-- Confirm and document that statistics imports are additive only: every sync upserts the currently cached ~31-day window and backfills newly published days, but never deletes or touches statistics outside that window.
-- Add a manually-configured time-of-use rate schedule (JSON, integration options) and a Calculated TOU Cost sensor per electricity service, since GloBird's API exposes no usable $/kWh rate data (verified against getProductsByAccountId and getAllProductHistoriesByAccountId, which return only plan name/dates, no rates). Calculates cost from real per-interval usage split across your configured Peak/Offpeak/etc. windows.
+- Fix a MALFORMED_ARGUMENT error when opening integration options: the options description text embedded a raw JSON example with curly braces, which Home Assistant's frontend interprets as ICU MessageFormat placeholders. The example was likely breaking the options form before a TOU rate schedule could be saved, leaving the Calculated TOU Cost sensor stuck unavailable even after entering a schedule. Removed the inline JSON from the translated string (kept in the README instead) and synced the previously-stale strings.json with translations/en.json.
