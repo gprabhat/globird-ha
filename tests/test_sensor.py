@@ -429,8 +429,14 @@ def test_gas_statistics_ignore_downward_correction_without_double_counting() -> 
     assert [row["sum"] for row in statistics] == [100.0, 100.0, 102.0]
 
 
-def test_usage_half_hourly_statistics_accumulate_across_days() -> None:
-    """Each half-hour interval becomes a statistic row with a running sum."""
+def test_usage_half_hourly_statistics_aggregate_into_hourly_buckets() -> None:
+    """Sub-hourly intervals are summed into hourly rows with a running sum.
+
+    Home Assistant's recorder rejects external statistics whose `start` is
+    not exactly on the hour, so even though GloBird reports finer-grained
+    intervals (5- or 30-minute), the statistics import must bucket them to
+    the hour before handing them to async_add_external_statistics.
+    """
     local_tz = timezone(timedelta(hours=10))
     statistics = sensor._build_usage_half_hourly_statistics(
         [
@@ -440,15 +446,16 @@ def test_usage_half_hourly_statistics_accumulate_across_days() -> None:
         tzinfo=local_tz,
     )
 
-    assert len(statistics) == 96
-    assert [row["state"] for row in statistics[:3]] == [0.1, 0.1, 0.1]
-    assert statistics[47]["sum"] == 4.8
-    assert statistics[48]["sum"] == 5.3
-    assert statistics[49]["sum"] == 6.8
+    # 24 hourly rows per day, not 48 half-hourly rows.
+    assert len(statistics) == 48
+    assert all(row["start"].minute == 0 and row["start"].second == 0 for row in statistics)
+    assert [row["state"] for row in statistics[:3]] == [0.2, 0.2, 0.2]
+    assert statistics[23]["sum"] == 4.8
+    assert statistics[24]["sum"] == 6.8
+    assert statistics[25]["sum"] == 6.8
     assert statistics[0]["start"] == datetime(2026, 4, 23, 0, 0, tzinfo=local_tz)
-    assert statistics[1]["start"] == datetime(2026, 4, 23, 0, 30, tzinfo=local_tz)
-    assert statistics[48]["start"] == datetime(2026, 4, 24, 0, 0, tzinfo=local_tz)
-    assert statistics[49]["start"] == datetime(2026, 4, 24, 0, 30, tzinfo=local_tz)
+    assert statistics[1]["start"] == datetime(2026, 4, 23, 1, 0, tzinfo=local_tz)
+    assert statistics[24]["start"] == datetime(2026, 4, 24, 0, 0, tzinfo=local_tz)
 
 
 def test_usage_half_hourly_statistics_skip_days_without_intervals() -> None:
@@ -463,7 +470,10 @@ def test_usage_half_hourly_statistics_skip_days_without_intervals() -> None:
     )
 
     assert len(statistics) == 2
+    assert statistics[0]["start"] == datetime(2026, 4, 25, 0, 0, tzinfo=timezone.utc)
     assert statistics[0]["sum"] == 1.0
+    assert statistics[1]["start"] == datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
+    assert statistics[1]["sum"] == 3.0
 
 
 def test_usage_total_sensor_exposes_recent_intervals_by_day() -> None:

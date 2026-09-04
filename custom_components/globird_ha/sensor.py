@@ -284,7 +284,17 @@ def _build_usage_half_hourly_statistics(
     *,
     tzinfo: Any,
 ) -> list[dict[str, Any]]:
-    """Build cumulative-sum statistics from per-day half-hourly usage intervals."""
+    """Build cumulative-sum hourly statistics from per-day usage intervals.
+
+    Home Assistant's recorder rejects external statistics whose `start` is
+    not exactly on the hour (minutes/seconds must be 0) -- external
+    statistics only support hourly resolution, regardless of how fine the
+    source interval data is. So sub-hourly intervals (GloBird reports 5- or
+    30-minute intervals depending on the meter) are summed into hourly
+    buckets here before being handed to the recorder; the finer-grained data
+    is still available raw via calculate_tou_cost and the intervals_by_day
+    attribute, just not through this statistics import.
+    """
     rows = sorted(
         (
             row
@@ -299,8 +309,7 @@ def _build_usage_half_hourly_statistics(
     if not rows:
         return []
 
-    statistics: list[dict[str, Any]] = []
-    cumulative_sum = 0.0
+    hourly_usage: dict[datetime, float] = {}
     for row in rows:
         day = _parse_portal_day(row["readDate"])
         intervals = row["intervals"]
@@ -308,14 +317,22 @@ def _build_usage_half_hourly_statistics(
         day_start = datetime.combine(day, dt_time.min, tzinfo=tzinfo)
         for index, value in enumerate(intervals):
             usage = float(value) if isinstance(value, (int, float)) else 0.0
-            cumulative_sum += usage
-            statistics.append(
-                {
-                    "start": day_start + timedelta(minutes=index * minutes_per_interval),
-                    "state": round(usage, 5),
-                    "sum": round(cumulative_sum, 5),
-                }
-            )
+            interval_start = day_start + timedelta(minutes=index * minutes_per_interval)
+            hour_start = interval_start.replace(minute=0, second=0, microsecond=0)
+            hourly_usage[hour_start] = hourly_usage.get(hour_start, 0.0) + usage
+
+    statistics: list[dict[str, Any]] = []
+    cumulative_sum = 0.0
+    for hour_start in sorted(hourly_usage):
+        usage = hourly_usage[hour_start]
+        cumulative_sum += usage
+        statistics.append(
+            {
+                "start": hour_start,
+                "state": round(usage, 5),
+                "sum": round(cumulative_sum, 5),
+            }
+        )
     return statistics
 
 
