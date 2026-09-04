@@ -1,3 +1,5 @@
-## v0.1.44
+## v0.1.45
 
-- Fix a MALFORMED_ARGUMENT error when opening integration options: the options description text embedded a raw JSON example with curly braces, which Home Assistant's frontend interprets as ICU MessageFormat placeholders. The example was likely breaking the options form before a TOU rate schedule could be saved, leaving the Calculated TOU Cost sensor stuck unavailable even after entering a schedule. Removed the inline JSON from the translated string (kept in the README instead) and synced the previously-stale strings.json with translations/en.json.
+- Fix a real bug behind Calculated TOU Cost staying "Unavailable" even after saving a valid rate schedule: `ConfigEntry.options` on real Home Assistant is a `types.MappingProxyType`, which `isinstance(options, dict)` evaluates as `False` for — so the daily polling start time and TOU rate schedule options were silently never read at all on real installs, despite passing in tests that used plain dicts. Both checks now use `collections.abc.Mapping`, with a regression test built on an actual `MappingProxyType` to prevent this from regressing silently again.
+- Add a separate, gas-shaped rate schedule (daily charge + seasonal inclining-block $/MJ tiers applied to average daily usage per meter-read period, plus a configurable m³→MJ heating-value conversion factor) and a Calculated Gas Cost sensor per gas service, since gas billing has nothing in common with electricity's time-of-use structure.
+- Fix a stray typo that corrupted the JSON example in the README's TOU rate schedule documentation.
