@@ -1,3 +1,3 @@
-## v0.1.46
+## v0.1.47
 
-- Fix the Recent Usage Total statistics import failing outright ("Invalid timestamp: timestamps must be from the top of the hour") on every sync since it was introduced. Home Assistant's recorder only accepts external statistics on hour-aligned timestamps -- it does not support sub-hourly external statistics at all, regardless of source data resolution. Sub-hourly usage intervals (GloBird reports 5- or 30-minute intervals depending on the meter) are now summed into hourly buckets before being handed to the recorder. The finer-grained data is unaffected elsewhere: it still feeds the `intervals_by_day` attribute and the Calculated TOU Cost sensor's per-interval accuracy.
+- Add an MIT LICENSE file, enable GitHub Issues, and set repository topics to fix HACS repository validation failures (missing license, issues disabled, no topics).
