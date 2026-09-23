@@ -1365,6 +1365,28 @@ def build_weather_summary(weather_payload: dict[str, Any] | None) -> dict[str, A
     }
 
 
+def build_account_cost_summary(
+    cost_summary_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the portal's own estimated total account cost summary.
+
+    This is GloBird's own running total (not derived from daily cost rows
+    like Expected Monthly Cost/Billing Period Cost), typically covering the
+    period since the account's last cost reset (e.g. since switching or the
+    last invoice).
+    """
+    data = _payload_data(cost_summary_payload)
+    if not isinstance(data, dict):
+        data = {}
+
+    return {
+        "total_cost": _round(_as_float(data.get("totalCost")), 2),
+        "total_feed_in_cost": _round(_as_float(data.get("totalFeedInCost")), 2),
+        "from_date": data.get("from"),
+        "to_date": data.get("to"),
+    }
+
+
 def date_range_for_usage(
     days: int = DEFAULT_USAGE_DAYS,
 ) -> tuple[str, str, str, str, str, str]:
@@ -1635,6 +1657,15 @@ class GloBirdClient:
     ) -> dict[str, Any]:
         """Fetch signup/service information."""
         path = "/api/account/getSignupInfo"
+        if account_id is not None:
+            path = f"{path}?accountId={account_id}"
+        return await self._request_json("GET", path)
+
+    async def get_account_cost_summary(
+        self, *, account_id: int | str | None = None
+    ) -> dict[str, Any]:
+        """Fetch the portal's own estimated total account cost summary."""
+        path = "/api/transaction/getaccountcostsummary"
         if account_id is not None:
             path = f"{path}?accountId={account_id}"
         return await self._request_json("GET", path)

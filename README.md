@@ -43,6 +43,7 @@ Account-level sensors include:
 
 - Account balance
 - Dashboard balance and recent transactions
+- Account cost summary (the portal's own running cost estimate, typically since the account's last reset/switch)
 - Latest invoice
 - Signup services
 - Weather impacted days
@@ -98,6 +99,8 @@ GloBird usage and cost data normally trails by at least one day, and the portal 
 ZeroHero status reports the latest complete portal result as `achieved` or `missed`, and exposes date-aware attributes so automations can tell whether that result is for the current Home Assistant local day. It reports `unknown` before any usable complete cost day is available.
 
 Expected Monthly Cost projects the current billing period from completed daily net cost totals, using the latest invoice issue date as the billing-period start and a 30-day period. Billing Period Cost uses the same daily net totals so it matches the projection inputs. Billing Period Days uses Home Assistant's local date rather than the host process timezone.
+
+Account Cost Summary is different from those two: it is GloBird's own server-side running estimate for the account (`totalCost`/`totalFeedInCost` over a `from`/`to` date range the portal itself chooses, typically since the account's last switch or cost reset), not something derived locally from daily cost rows. Treat it as GloBird's own answer to "what do I owe so far," and the Expected Monthly Cost/Billing Period Cost sensors as this integration's own projection for the current billing cycle specifically — they can legitimately disagree since they cover different date ranges and methods.
 
 Pricing/rate-plan sensors are not populated from the portal. GloBird's API exposes only product metadata (plan name, start/end date, a couple of flags) through `getProductsByAccountId` and `getAllProductHistoriesByAccountId` — verified directly, neither returns $/kWh rate figures — so there isn't enough rate detail available to derive prices automatically or safely provide EMHASS-ready import/export price sensors.
 

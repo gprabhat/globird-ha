@@ -1021,6 +1021,45 @@ def test_calculate_gas_cost_returns_empty_without_a_schedule() -> None:
     assert result == {"periods": [], "latest_period_cost": None, "total_cost": None}
 
 
+def test_build_account_cost_summary_parses_portal_estimate() -> None:
+    """The portal's own account cost summary is parsed into a simple shape."""
+    payload = {
+        "data": {
+            "totalCost": 83.22,
+            "totalFeedInCost": 0.0,
+            "from": "2026-09-02T00:00:00",
+            "to": "2026-09-23T00:00:00",
+        },
+        "message": None,
+        "success": True,
+    }
+
+    summary = api.build_account_cost_summary(payload)
+
+    assert summary == {
+        "total_cost": 83.22,
+        "total_feed_in_cost": 0.0,
+        "from_date": "2026-09-02T00:00:00",
+        "to_date": "2026-09-23T00:00:00",
+    }
+
+
+def test_build_account_cost_summary_handles_missing_payload() -> None:
+    """A missing/malformed payload degrades to all-None rather than raising."""
+    assert api.build_account_cost_summary(None) == {
+        "total_cost": None,
+        "total_feed_in_cost": None,
+        "from_date": None,
+        "to_date": None,
+    }
+    assert api.build_account_cost_summary({"data": None}) == {
+        "total_cost": None,
+        "total_feed_in_cost": None,
+        "from_date": None,
+        "to_date": None,
+    }
+
+
 def test_meter_type_description_looks_up_by_serial() -> None:
     """Meter type descriptions are looked up by serial number, and missing serials are safe."""
     payload = {"data": {"700594829": "Smart", "080625": "Manually read interval"}}
@@ -1230,6 +1269,8 @@ def load_tests(
         test_usage_intervals_are_not_double_counted_across_tou_periods,
         test_cost_summary_breaks_down_by_charge_type,
         test_cost_summary_charge_type_totals_empty_when_type_missing,
+        test_build_account_cost_summary_parses_portal_estimate,
+        test_build_account_cost_summary_handles_missing_payload,
         test_meter_type_description_looks_up_by_serial,
         test_parse_gas_rate_schedule_returns_none_when_blank,
         test_parse_gas_rate_schedule_requires_positive_conversion_factor,

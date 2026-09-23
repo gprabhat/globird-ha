@@ -27,6 +27,7 @@ from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import EnergyConverter, VolumeConverter
 
 from .api import (
+    build_account_cost_summary,
     build_billing_period_projection,
     build_latest_data_status,
     calculated_cost_attributes,
@@ -112,6 +113,16 @@ def _dashboard_attrs(data: dict[str, Any]) -> dict[str, Any]:
         "latest_invoice": dashboard.get("lastestInvoice"),
         "recent_transactions": _recent_transactions(data),
     }
+
+
+def _account_cost_summary_value(data: dict[str, Any]) -> Any:
+    return build_account_cost_summary(data.get("account_cost_summary")).get(
+        "total_cost"
+    )
+
+
+def _account_cost_summary_attrs(data: dict[str, Any]) -> dict[str, Any]:
+    return build_account_cost_summary(data.get("account_cost_summary"))
 
 
 def _latest_invoice_value(data: dict[str, Any]) -> Any:
@@ -466,6 +477,15 @@ GLOBAL_SENSORS: tuple[GloBirdSensorDescription, ...] = (
         native_unit_of_measurement=CURRENCY_AUD,
         device_class=SensorDeviceClass.MONETARY,
         icon="mdi:view-dashboard",
+    ),
+    GloBirdSensorDescription(
+        key="account_cost_summary",
+        name="Account Cost Summary",
+        value_fn=_account_cost_summary_value,
+        attrs_fn=_account_cost_summary_attrs,
+        native_unit_of_measurement=CURRENCY_AUD,
+        device_class=SensorDeviceClass.MONETARY,
+        icon="mdi:cash-multiple",
     ),
     GloBirdSensorDescription(
         key="latest_invoice",

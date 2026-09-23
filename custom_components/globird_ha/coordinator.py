@@ -292,6 +292,14 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     cache,
                     _errors=fetch_errors,
                 )
+                data["account_cost_summary"] = await self._fetch_optional(
+                    "account_cost_summary",
+                    lambda: self.client.get_account_cost_summary(
+                        account_id=primary_account_id
+                    ),
+                    cache,
+                    _errors=fetch_errors,
+                )
                 data["service_status"] = await self._fetch_optional(
                     "service_status",
                     self.client.get_account_service_status,
