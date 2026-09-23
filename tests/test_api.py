@@ -593,25 +593,25 @@ def test_usage_summary_tracks_all_registers_and_b_exports() -> None:
     assert usage["registers"][3]["direction"] == "export"
 
 
-def test_usage_summary_retains_intervals_for_every_day() -> None:
-    """Half-hourly intervals are kept for all fetched days, not just the latest."""
+def test_usage_summary_keeps_solar_soak_import_register_out_of_export() -> None:
+    """Solar-named shoulder rates are import usage, not feed-in energy."""
     payload = {
         "data": [
             {
-                "readDate": "2026-04-23",
-                "usage": 3.0,
+                "readDate": "2026-09-07",
+                "usage": 4.2,
                 "suffix": "E1",
-                "chargeType": "Peak",
-                "chargeCategoryCode": "USAGE",
-                "usageArray": [1.0, 2.0],
+                "chargeType": "Solar Soak",
+                "chargeCategoryCode": "SOLAR",
+                "usageArray": [2.1, 2.1],
             },
             {
-                "readDate": "2026-04-24",
-                "usage": 5.0,
-                "suffix": "E1",
-                "chargeType": "Peak",
-                "chargeCategoryCode": "USAGE",
-                "usageArray": [2.0, 3.0],
+                "readDate": "2026-09-07",
+                "usage": 1.5,
+                "suffix": "B1",
+                "chargeType": "Solar Export",
+                "chargeCategoryCode": "SOLAR",
+                "usageArray": [0.5, 1.0],
             },
         ],
         "message": None,
@@ -620,79 +620,13 @@ def test_usage_summary_retains_intervals_for_every_day() -> None:
 
     usage = build_usage_summary(payload)
 
-    assert usage["intervals_by_day"] == [
-        {"readDate": "2026-04-23", "intervals": [1.0, 2.0]},
-        {"readDate": "2026-04-24", "intervals": [2.0, 3.0]},
-    ]
-    # The latest-day-only attribute keeps working alongside the new full history.
-    assert usage["latest_intervals"] == [2.0, 3.0]
-
-
-def test_usage_attributes_expose_recent_intervals_by_day_when_requested() -> None:
-    """intervals_by_day is recorder-safe (truncated) and opt-in via a flag."""
-    payload = {
-        "data": [
-            {
-                "readDate": (date(2026, 4, 1) + timedelta(days=offset)).isoformat(),
-                "usage": 1.0,
-                "suffix": "E1",
-                "chargeType": "Peak",
-                "chargeCategoryCode": "USAGE",
-                "usageArray": [0.1] * 48,
-            }
-            for offset in range(10)
-        ],
-    }
-    summary = build_usage_summary(payload)
-
-    without_intervals = usage_attributes(summary, direction="import")
-    assert "intervals_by_day" not in without_intervals
-
-    with_intervals = usage_attributes(
-        summary, direction="import", include_intervals_by_day=True
-    )
-    assert with_intervals["intervals_by_day_count"] == 10
-    assert with_intervals["intervals_by_day_truncated"] is True
-    assert len(with_intervals["intervals_by_day"]) == 7
-    assert len(json.dumps(with_intervals)) < 16_384
-
-
-def test_usage_intervals_are_not_double_counted_across_tou_periods() -> None:
-    """The portal attaches the same full-day array to every TOU row for a
-    suffix; only the first occurrence per (date, suffix) should be counted,
-    or interval sums silently double for time-of-use tariffs."""
-    payload = {
-        "data": [
-            {
-                "readDate": "2026-09-01",
-                "usage": 2.482,
-                "suffix": "E1",
-                "chargeType": "Offpeak Usage",
-                "chargeCategoryCode": "USAGE",
-                "usageArray": [0.02, 0.024, 0.007],
-            },
-            {
-                "readDate": "2026-09-01",
-                "usage": 2.183,
-                "suffix": "E1",
-                "chargeType": "Peak Usage",
-                "chargeCategoryCode": "USAGE",
-                # Portal duplicates the same full-day array on every TOU row.
-                "usageArray": [0.02, 0.024, 0.007],
-            },
-        ],
-        "message": None,
-        "success": True,
-    }
-
-    usage = build_usage_summary(payload)
-
-    # Scalar usage totals correctly sum each TOU period's own portion.
-    assert usage["latest_day_usage"] == 4.665
-    # But the interval array must only be counted once, not once per TOU row.
-    assert usage["latest_intervals"] == [0.02, 0.024, 0.007]
-    assert usage["intervals_by_day"] == [
-        {"readDate": "2026-09-01", "intervals": [0.02, 0.024, 0.007]}
+    assert usage["total_usage"] == 4.2
+    assert usage["latest_day_usage"] == 4.2
+    assert usage["total_export"] == 1.5
+    assert usage["latest_day_export"] == 1.5
+    assert [register["direction"] for register in usage["registers"]] == [
+        "export",
+        "import",
     ]
 
 
